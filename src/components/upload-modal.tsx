@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { FileUp, FolderUp, UploadCloud, X } from "lucide-react";
+import { CheckCircle2, FileUp, FolderUp, Loader2, UploadCloud, X, XCircle } from "lucide-react";
 import { useDropzone } from "react-dropzone";
 import {
   Dialog,
@@ -22,6 +22,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+const CHUNK_SIZE = 35 * 1024 * 1024; // 35 MB per chunk
+
 type FolderOption = {
   id: string;
   name: string;
@@ -39,10 +41,69 @@ type QueuedUpload = {
 type UploadItem = {
   id: string;
   name: string;
-  progress: number;
+  size: number;
+  progress: number; // 0–100
   status: "queued" | "uploading" | "success" | "error";
+  statusText?: string;
   error?: string;
 };
+
+type ChunkResult = {
+  index: number;
+  telegramFileId: string;
+  telegramMessageId: number;
+  telegramChatId: string;
+  size: number;
+};
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+/** XHR upload with real progress events */
+function xhrUpload(
+  url: string,
+  body: FormData | string,
+  headers: Record<string, string> = {},
+  onProgress?: (pct: number) => void,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          resolve(xhr.responseText);
+        }
+      } else {
+        try {
+          const err = JSON.parse(xhr.responseText);
+          reject(new Error(err.error ?? `HTTP ${xhr.status}`));
+        } catch {
+          reject(new Error(`HTTP ${xhr.status}`));
+        }
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.ontimeout = () => reject(new Error("Request timed out"));
+
+    xhr.open("POST", url);
+    Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+    xhr.send(body);
+  });
+}
 
 export function UploadModal() {
   const router = useRouter();
@@ -65,26 +126,16 @@ export function UploadModal() {
     if (!open) return;
     fetch("/api/folders")
       .then((res) => res.json())
-      .then((payload) => {
-        if (payload.success) {
-          setFolders(payload.data);
-        }
-      })
+      .then((payload) => { if (payload.success) setFolders(payload.data); })
       .catch(() => null);
   }, [open]);
 
   function queueFiles(acceptedFiles: File[]) {
     if (acceptedFiles.length === 0) return;
-
     const nextUploads = acceptedFiles.map((file) => {
-      const directoryFile = file as File & { webkitRelativePath?: string };
-      const relativePath = directoryFile.webkitRelativePath?.trim() || null;
-      return {
-        id: crypto.randomUUID(),
-        file,
-        label: relativePath || file.name,
-        relativePath,
-      };
+      const df = file as File & { webkitRelativePath?: string };
+      const relativePath = df.webkitRelativePath?.trim() || null;
+      return { id: crypto.randomUUID(), file, label: relativePath || file.name, relativePath };
     });
 
     setOpen(true);
@@ -94,8 +145,12 @@ export function UploadModal() {
       ...nextUploads.map((entry) => ({
         id: entry.id,
         name: entry.label,
+        size: entry.file.size,
         progress: 0,
         status: "queued" as const,
+        statusText: entry.file.size > CHUNK_SIZE
+          ? `${Math.ceil(entry.file.size / CHUNK_SIZE)} chunks · ${formatBytes(entry.file.size)}`
+          : formatBytes(entry.file.size),
       })),
     ]);
   }
@@ -107,124 +162,193 @@ export function UploadModal() {
 
   const totalProgress = useMemo(() => {
     if (items.length === 0) return 0;
-    return items.reduce((sum, item) => sum + item.progress, 0) / items.length;
+    return Math.round(items.reduce((sum, i) => sum + i.progress, 0) / items.length);
   }, [items]);
 
+  function updateItem(id: string, patch: Partial<UploadItem>) {
+    setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  }
+
   async function createFolder(name: string, parentId: string | null) {
-    const response = await fetch("/api/folders", {
+    const res = await fetch("/api/folders", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, parentId }),
     });
-    const payload = await response.json();
-
-    if (!payload.success) {
-      throw new Error(payload.error ?? `Unable to create folder ${name}`);
-    }
-
+    const payload = await res.json();
+    if (!payload.success) throw new Error(payload.error ?? `Cannot create folder ${name}`);
     return payload.data as FolderOption;
   }
 
   async function ensureTargetFolder(relativePath: string | null, folderCache: FolderOption[]) {
     let currentParentId = folderId === "root" ? null : folderId;
-
-    if (!relativePath) {
-      return currentParentId;
-    }
-
+    if (!relativePath) return currentParentId;
     const segments = relativePath.split("/").slice(0, -1).filter(Boolean);
-    if (segments.length === 0) {
-      return currentParentId;
-    }
-
     for (const segment of segments) {
-      let folder = folderCache.find(
-        (item) => item.parentId === currentParentId && item.name === segment,
-      );
-
+      let folder = folderCache.find((f) => f.parentId === currentParentId && f.name === segment);
       if (!folder) {
         folder = await createFolder(segment, currentParentId);
         folderCache.push(folder);
       }
-
       currentParentId = folder.id;
     }
-
     return currentParentId;
+  }
+
+  /** Small file (≤ 45 MB) — single XHR with real upload progress */
+  async function uploadSingleFile(entry: QueuedUpload, targetFolderId: string | null) {
+    const formData = new FormData();
+    formData.append("files", entry.file);
+    if (targetFolderId) formData.append("folderId:0", targetFolderId);
+
+    const payload = await xhrUpload("/api/files/upload", formData, {}, (pct) => {
+      updateItem(entry.id, {
+        progress: pct,
+        statusText: `Uploading… ${pct}%`,
+      });
+    }) as { success: boolean; error?: string; data?: { index: number; status: string; error?: string }[] };
+
+    if (!payload.success) throw new Error(payload.error ?? "Upload failed");
+    const result = payload.data?.[0];
+    if (result?.status === "error") throw new Error(result.error ?? "Upload failed");
+    return result;
+  }
+
+  /** Large file (> 45 MB) — chunk-by-chunk with real per-chunk progress */
+  async function uploadChunkedFile(entry: QueuedUpload, targetFolderId: string | null) {
+    const uploadId = crypto.randomUUID();
+    const totalChunks = Math.ceil(entry.file.size / CHUNK_SIZE);
+    const chunkResults: ChunkResult[] = [];
+
+
+
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, entry.file.size);
+      const slice = entry.file.slice(start, end);
+      const chunkFile = new File(
+        [slice],
+        `${entry.file.name}.part${String(i).padStart(4, "0")}`,
+        { type: "application/octet-stream" },
+      );
+
+      const formData = new FormData();
+      formData.append("chunk", chunkFile);
+      formData.append("chunkIndex", String(i));
+      formData.append("totalChunks", String(totalChunks));
+      formData.append("uploadId", uploadId);
+
+      // Base progress from completed chunks, plus live progress of current chunk
+      const baseProgress = Math.round((i / totalChunks) * 90);
+      const chunkWeight = 90 / totalChunks;
+
+      const data = await xhrUpload("/api/files/upload-chunk", formData, {}, (pct) => {
+        updateItem(entry.id, {
+          progress: Math.round(baseProgress + (pct / 100) * chunkWeight),
+          statusText: `Chunk ${i + 1} / ${totalChunks} — ${pct}%`,
+        });
+      }) as { success: boolean; error?: string; data?: ChunkResult };
+
+      if (!data.success) throw new Error(data.error ?? `Chunk ${i + 1} failed`);
+      chunkResults.push(data.data!);
+    }
+
+    updateItem(entry.id, { progress: 92, statusText: "Finalizing…" });
+
+    const res = await fetch("/api/files/finalize-chunked", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        uploadId,
+        originalName: entry.file.name,
+        mimeType: entry.file.type || "application/octet-stream",
+        size: entry.file.size,
+        chunks: chunkResults,
+        folderId: targetFolderId,
+      }),
+    });
+
+
+
+    const finalData = await res.json();
+    if (!finalData.success) throw new Error(finalData.error ?? "Finalize failed");
+    return finalData.data;
   }
 
   async function handleUpload() {
     if (queuedUploads.length === 0 || submitting) return;
-
     setSubmitting(true);
-    setItems((prev) => prev.map((item) => ({ ...item, status: "uploading", progress: 30 })));
 
     try {
-      const formData = new FormData();
       const folderCache = [...folders];
 
-      for (const [index, entry] of queuedUploads.entries()) {
-        formData.append("files", entry.file);
+      for (const entry of queuedUploads) {
+        try {
+          updateItem(entry.id, { status: "uploading", progress: 0, statusText: "Starting…" });
+          const targetFolderId = await ensureTargetFolder(entry.relativePath, folderCache);
 
-        const targetFolderId = await ensureTargetFolder(entry.relativePath, folderCache);
-        if (targetFolderId) {
-          formData.append(`folderId:${index}`, targetFolderId);
+          if (entry.file.size > CHUNK_SIZE) {
+            await uploadChunkedFile(entry, targetFolderId);
+          } else {
+            await uploadSingleFile(entry, targetFolderId);
+          }
+
+          updateItem(entry.id, { status: "success", progress: 100, statusText: "Done ✓" });
+        } catch (err) {
+          updateItem(entry.id, {
+            status: "error",
+            progress: 0,
+            statusText: undefined,
+            error: err instanceof Error ? err.message : "Upload failed",
+          });
         }
       }
 
-      const response = await fetch("/api/files/upload", {
-        method: "POST",
-        body: formData,
-      });
-      const payload = await response.json();
-
-      const nextItems = items.map((item, index) => {
-        const result = payload.data?.find((entry: { index: number }) => entry.index === index);
-        return {
-          ...item,
-          progress: 100,
-          status: result?.status === "success" ? "success" : "error",
-          error: result?.error,
-        } as UploadItem;
-      });
-
-      setItems(nextItems);
       setFolders(folderCache);
       router.refresh();
 
-      const hasError = nextItems.some((item) => item.status === "error");
-      if (!hasError) {
-        setQueuedUploads([]);
-        setItems([]);
-        setFolderId("root");
-        setOpen(false);
-      }
+      setItems((current) => {
+        const hasError = current.some((i) => i.status === "error");
+        if (!hasError) {
+          setTimeout(() => {
+            setQueuedUploads([]);
+            setItems([]);
+            setFolderId("root");
+            setOpen(false);
+          }, 1000);
+        }
+        return current;
+      });
     } finally {
       setSubmitting(false);
     }
   }
 
   function removeFile(id: string) {
-    setQueuedUploads((prev) => prev.filter((entry) => entry.id !== id));
-    setItems((prev) => prev.filter((item) => item.id !== id));
+    if (submitting) return;
+    setQueuedUploads((prev) => prev.filter((e) => e.id !== id));
+    setItems((prev) => prev.filter((i) => i.id !== id));
   }
+
+  const doneCount = items.filter((i) => i.status === "success").length;
+  const errorCount = items.filter((i) => i.status === "error").length;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <Button>Upload Files</Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle>Upload To Telegram Storage</DialogTitle>
           <DialogDescription>
-            Chọn file hoặc cả folder từ máy. Nếu folder local có subfolder, app sẽ tạo cấu trúc
-            tương ứng trong storage.
+            File &gt; 35 MB sẽ tự động chia chunk và ghép lại khi tải xuống.
           </DialogDescription>
         </DialogHeader>
 
+        {/* Folder selector */}
         <div className="mt-4">
-          <Select value={folderId} onValueChange={setFolderId}>
+          <Select value={folderId} onValueChange={setFolderId} disabled={submitting}>
             <SelectTrigger>
               <SelectValue placeholder="Select folder" />
             </SelectTrigger>
@@ -239,9 +363,10 @@ export function UploadModal() {
           </Select>
         </div>
 
+        {/* Drop zone */}
         <div
           {...getRootProps()}
-          className={`mt-6 rounded-2xl border border-dashed p-10 text-center transition ${
+          className={`mt-4 rounded-2xl border border-dashed p-8 text-center transition ${
             isDragActive ? "border-primary bg-primary/5" : "border-border"
           }`}
         >
@@ -251,59 +376,101 @@ export function UploadModal() {
             type="file"
             className="hidden"
             multiple
-            onChange={(event) => {
-              queueFiles(Array.from(event.target.files ?? []));
-              event.currentTarget.value = "";
-            }}
+            onChange={(e) => { queueFiles(Array.from(e.target.files ?? [])); e.currentTarget.value = ""; }}
           />
-          <UploadCloud className="mx-auto h-10 w-10 text-primary" />
-          <p className="mt-4 font-medium">Drag & drop files here</p>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Drop files, choose files, hoặc chọn cả folder từ máy rồi bấm Upload.
-          </p>
-          <div className="mt-4 flex flex-wrap justify-center gap-3">
-            <Button type="button" onClick={openPicker}>
-              <FileUp className="mr-2 h-4 w-4" />
-              Choose Files
+          <UploadCloud className="mx-auto h-9 w-9 text-primary" />
+          <p className="mt-3 font-medium">Drag &amp; drop files here</p>
+          <div className="mt-3 flex flex-wrap justify-center gap-2">
+            <Button type="button" size="sm" onClick={openPicker} disabled={submitting}>
+              <FileUp className="mr-1.5 h-3.5 w-3.5" /> Choose Files
             </Button>
-            <Button type="button" variant="outline" onClick={() => folderInputRef.current?.click()}>
-              <FolderUp className="mr-2 h-4 w-4" />
-              Choose Folder
+            <Button type="button" size="sm" variant="outline" onClick={() => folderInputRef.current?.click()} disabled={submitting}>
+              <FolderUp className="mr-1.5 h-3.5 w-3.5" /> Choose Folder
             </Button>
           </div>
         </div>
 
-        {items.length > 0 ? (
-          <div className="mt-6 space-y-3">
-            <Progress value={totalProgress} />
-            {items.map((item) => (
-              <div
-                key={item.id}
-                className="flex items-center justify-between rounded-xl border border-border/70 p-3"
-              >
-                <div className="min-w-0">
-                  <div className="truncate font-medium">{item.name}</div>
-                  <div className="text-xs text-muted-foreground">
-                    {item.status === "error" ? item.error : item.status}
-                  </div>
+        {/* File list */}
+        {items.length > 0 && (
+          <div className="mt-4 space-y-2">
+            {/* Overall progress */}
+            {submitting && (
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>{doneCount} / {items.length} files</span>
+                  <span>{totalProgress}%</span>
                 </div>
-                <div className="ml-4 flex items-center gap-3">
-                  <div className="text-sm">{item.progress}%</div>
-                  <button onClick={() => removeFile(item.id)} type="button">
-                    <X className="h-4 w-4 text-muted-foreground" />
-                  </button>
-                </div>
+                <Progress value={totalProgress} className="h-1.5" />
               </div>
-            ))}
-          </div>
-        ) : null}
+            )}
 
-        <div className="mt-6 flex justify-end gap-3">
-          <Button type="button" onClick={handleUpload} disabled={queuedUploads.length === 0 || submitting}>
-            <FileUp className="mr-2 h-4 w-4" />
-            {submitting ? "Uploading..." : "Upload"}
+            {/* Per-file rows */}
+            <div className="max-h-64 overflow-y-auto space-y-2 pr-1">
+              {items.map((item) => (
+                <div
+                  key={item.id}
+                  className="rounded-xl border border-border/70 p-3 space-y-1.5"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium">{item.name}</div>
+                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground mt-0.5">
+                        {item.status === "uploading" && (
+                          <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                        )}
+                        {item.status === "success" && (
+                          <CheckCircle2 className="h-3 w-3 text-green-500 shrink-0" />
+                        )}
+                        {item.status === "error" && (
+                          <XCircle className="h-3 w-3 text-destructive shrink-0" />
+                        )}
+                        <span className={item.status === "error" ? "text-destructive" : ""}>
+                          {item.status === "error" ? item.error : (item.statusText ?? item.status)}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {item.status === "uploading" && (
+                        <span className="text-xs font-mono text-muted-foreground w-10 text-right">
+                          {item.progress}%
+                        </span>
+                      )}
+                      {!submitting && (
+                        <button onClick={() => removeFile(item.id)} type="button" className="text-muted-foreground hover:text-foreground">
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Per-file progress bar */}
+                  {item.status === "uploading" && (
+                    <Progress value={item.progress} className="h-1" />
+                  )}
+                  {item.status === "success" && (
+                    <Progress value={100} className="h-1 [&>div]:bg-green-500" />
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {errorCount > 0 && !submitting && (
+              <p className="text-xs text-destructive">{errorCount} file failed. Fix errors and retry.</p>
+            )}
+          </div>
+        )}
+
+        <div className="mt-4 flex justify-end gap-2">
+          <Button
+            type="button"
+            onClick={handleUpload}
+            disabled={queuedUploads.length === 0 || submitting}
+          >
+            {submitting
+              ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Uploading…</>
+              : <><FileUp className="mr-2 h-4 w-4" />Upload</>}
           </Button>
-          <Button variant="outline" onClick={() => setOpen(false)}>
+          <Button variant="outline" onClick={() => setOpen(false)} disabled={submitting}>
             Close
           </Button>
         </div>

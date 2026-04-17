@@ -118,3 +118,47 @@ export async function telegramSendTestMessage(customChatId?: string) {
     messageId: result.message_id,
   };
 }
+
+export async function sendTelegramLogMessage(text: string) {
+  const result = await telegramFetch<{ message_id: number }>("/sendMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: env.TELEGRAM_STORAGE_CHAT_ID,
+      text,
+    }),
+  });
+  return result.message_id;
+}
+
+export async function groupTelegramDocuments(chatId: string, fileIds: string[], caption?: string) {
+  // Telegram allows max 10 media per group. We chunk the requests if there are more.
+  const results: Array<{ message_id: number; file_id: string }> = [];
+  
+  for (let i = 0; i < fileIds.length; i += 10) {
+    const batch = fileIds.slice(i, i + 10);
+    const media = batch.map((fileId, idx) => ({
+      type: "document",
+      media: fileId,
+      caption: (i === 0 && idx === 0) ? caption : undefined,
+    }));
+
+    const payloads = await telegramFetch<Array<{
+      message_id: number;
+      document?: { file_id: string };
+    }>>("/sendMediaGroup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, media }),
+    });
+    
+    for (let j = 0; j < payloads.length; j++) {
+      results.push({
+        message_id: payloads[j].message_id,
+        file_id: payloads[j].document?.file_id ?? batch[j],
+      });
+    }
+  }
+  
+  return results;
+}

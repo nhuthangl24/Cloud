@@ -3,7 +3,7 @@ import { z } from "zod";
 const envSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1).default("telegram-token-placeholder"),
   TELEGRAM_STORAGE_CHAT_ID: z.string().min(1).default("-1000000000000"),
-  REDIS_URL: z.string().optional(),
+  MONGODB_URI: z.string().min(1, "MONGODB_URI is required"),
   AUTH_USERNAME: z.string().min(1).default("admin"),
   AUTH_PASSWORD: z.string().min(8).default("ChangeMe123!"),
   AUTH_PASSWORD_HASH: z.string().optional(),
@@ -19,7 +19,7 @@ const envSchema = z.object({
 export const env = envSchema.parse({
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_STORAGE_CHAT_ID: process.env.TELEGRAM_STORAGE_CHAT_ID,
-  REDIS_URL: process.env.REDIS_URL,
+  MONGODB_URI: process.env.MONGODB_URI,
   AUTH_USERNAME: process.env.AUTH_USERNAME,
   AUTH_PASSWORD: process.env.AUTH_PASSWORD,
   AUTH_PASSWORD_HASH: process.env.AUTH_PASSWORD_HASH,

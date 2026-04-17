@@ -3,7 +3,7 @@ import {
   getFileByShareToken,
   incrementDownload,
   incrementShareDownload,
-  resolveDownloadUrl,
+  createFileDownloadResponse,
 } from "@/server/services/file.service";
 
 type RouteContext = { params: Promise<{ token: string }> };
@@ -28,10 +28,10 @@ export async function GET(request: Request, context: RouteContext) {
     }
 
     if (file.isDeleted) return fail("File unavailable", 404);
-    const downloadUrl = await resolveDownloadUrl(file);
+
     await incrementDownload(file);
     await incrementShareDownload(share.id);
-    return Response.redirect(downloadUrl, 302);
+    return await createFileDownloadResponse(file);
   } catch (error) {
     return fromError(error);
   }

@@ -14,7 +14,7 @@ const fontMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Cloud Telegram",
+  title: "Như Thắng Cloud",
   description: "Telegram-backed cloud storage with metadata management",
 };
 

@@ -14,7 +14,12 @@ export function ShareActions({
   const router = useRouter();
 
   async function onCopy() {
-    await navigator.clipboard.writeText(url);
+    try {
+      await navigator.clipboard.writeText(url);
+      window.alert("Link copied to clipboard.");
+    } catch {
+      window.prompt("Press Cmd/Ctrl+C to copy:", url);
+    }
   }
 
   async function onRevoke() {

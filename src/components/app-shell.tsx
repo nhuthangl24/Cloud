@@ -48,7 +48,7 @@ export function AppShell({ children, username, stats }: ShellProps) {
               <HardDrive className="h-5 w-5" />
             </div>
             <div>
-              <div className="font-semibold">Cloud Telegram</div>
+              <div className="font-semibold">Như Thắng Cloud</div>
               <div className="text-xs text-muted-foreground">{username}</div>
             </div>
           </Link>
@@ -81,7 +81,7 @@ export function AppShell({ children, username, stats }: ShellProps) {
                 <HardDrive className="h-5 w-5" />
               </div>
               <div>
-                <div className="font-semibold">Cloud Telegram</div>
+                <div className="font-semibold">Như Thắng Cloud</div>
                 <div className="text-xs text-muted-foreground">
                   Telegram storage layer
                 </div>
@@ -101,12 +101,14 @@ export function AppShell({ children, username, stats }: ShellProps) {
           <div className="mt-4 rounded-2xl bg-secondary/70 p-4">
             <div className="flex items-center justify-between text-sm">
               <span>Storage Usage</span>
-              <span className="font-medium">{usagePct.toFixed(0)}%</span>
+              <span className="font-medium">
+                {usagePct > 0 && usagePct < 1 ? "< 1%" : `${usagePct.toFixed(0)}%`}
+              </span>
             </div>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-background">
               <div
                 className="h-full rounded-full bg-primary"
-                style={{ width: `${usagePct}%` }}
+                style={{ width: `${usagePct > 0 ? Math.max(1, usagePct) : 0}%` }}
               />
             </div>
             <div className="mt-3 text-xs text-muted-foreground">

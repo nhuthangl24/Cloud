@@ -6,6 +6,14 @@ export type FileCategory =
   | "archive"
   | "other";
 
+export type FileChunk = {
+  index: number;
+  telegramFileId: string;
+  telegramMessageId: number;
+  telegramChatId: string;
+  size: number;
+};
+
 export type ActivityAction =
   | "UPLOAD"
   | "DOWNLOAD"
@@ -34,6 +42,8 @@ export type StoredFile = {
   telegramChatId: string;
   folderId: string | null;
   tags: string[];
+  isChunked: boolean;
+  chunks: FileChunk[];
   isDeleted: boolean;
   deletedAt: string | null;
   downloadCount: number;

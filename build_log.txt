@@ -1,0 +1,29 @@
+
+> cloud-telegram@0.1.0 build
+> next build
+
+   ▲ Next.js 15.5.15
+   - Environments: .env
+   - Experiments (use with caution):
+     · serverActions
+
+   Creating an optimized production build ...
+ ✓ Compiled successfully in 1286ms
+   Linting and checking validity of types ...
+   Collecting page data ...
+   Generating static pages (0/22) ...
+   Generating static pages (5/22) 
+   Generating static pages (10/22) 
+   Generating static pages (16/22) 
+Attempted to render <function n3({preloadCallbacks:e}){return e.forEach(e=>e()),null}> without development properties. This is not supported. It can happen if:
+- The element is created with a production version of React but rendered in development.
+- The element was cloned with a custom function instead of `React.cloneElement`.
+The props of this element may help locate this element: {
+  preloadCallbacks: [ [Function (anonymous)] { [length]: 0, [name]: '' }, [length]: 1 ]
+}
+Error occurred prerendering page "/dashboard". Read more: https://nextjs.org/docs/messages/prerender-error
+[TypeError: Cannot read properties of undefined (reading 'stack')] {
+  digest: '2461180685'
+}
+Export encountered an error on /dashboard/page: /dashboard, exiting the build.
+ ⨯ Next.js build worker exited with code: 1 and signal: null

@@ -131,6 +131,27 @@
   ],
   "activity": [
     {
+      "id": "10ef91f4-e6c1-466d-9eb3-fd76e47d7be3",
+      "action": "DELETE_HARD",
+      "status": "SUCCESS",
+      "message": "Hard deleted next.config.ts",
+      "fileId": "391b5ed4-4761-4d06-90c0-077c022d8d8c",
+      "metadata": {},
+      "createdAt": "2026-04-17T18:31:05.064Z"
+    },
+    {
+      "id": "72f5c692-84eb-465d-aae4-a7bf702bb8e4",
+      "action": "UPLOAD",
+      "status": "SUCCESS",
+      "message": "Uploaded next.config.ts",
+      "fileId": "391b5ed4-4761-4d06-90c0-077c022d8d8c",
+      "metadata": {
+        "telegramMessageId": 19,
+        "telegramChatId": "-5268753299"
+      },
+      "createdAt": "2026-04-17T18:29:38.104Z"
+    },
+    {
       "id": "03635a92-c50c-4ee6-b7bd-a1bcea3e35aa",
       "action": "FOLDER_DELETE",
       "status": "SUCCESS",

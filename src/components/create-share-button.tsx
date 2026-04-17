@@ -18,8 +18,12 @@ export function CreateShareButton({ fileId }: { fileId: string }) {
     setLoading(false);
 
     if (payload.success && payload.data?.publicUrl) {
-      await navigator.clipboard.writeText(payload.data.publicUrl);
-      window.alert("Share link copied to clipboard.");
+      try {
+        await navigator.clipboard.writeText(payload.data.publicUrl);
+        window.alert("Share link copied to clipboard.");
+      } catch {
+        window.prompt("Share link created. Press Cmd/Ctrl+C to copy:", payload.data.publicUrl);
+      }
     }
   }
 

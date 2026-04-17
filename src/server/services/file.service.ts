@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { buildPublicLink, noop } from "@/server/services/misc";
 import { mutateStore, readStore } from "@/lib/store";
-import { FolderRecord, ShareRecord, StoredFile } from "@/lib/types";
+import { FileChunk, FolderRecord, ShareRecord, StoredFile } from "@/lib/types";
 import { getCategory, getExtension } from "@/server/services/file-classifier.service";
 import { sha256FromBuffer } from "@/server/services/hash.service";
 import { createLog } from "@/server/services/log.service";
@@ -9,6 +9,7 @@ import { ensureWithinQuota } from "@/server/services/quota.service";
 import {
   deleteTelegramMessage,
   getTelegramFileDownloadUrl,
+  groupTelegramDocuments,
   uploadFileToTelegram,
 } from "@/server/services/telegram.service";
 import { slugify } from "@/lib/utils";
@@ -196,6 +197,8 @@ export async function uploadOwnedFile(params: {
         telegramChatId: telegram.telegramChatId,
         folderId: params.folderId ?? null,
         tags: params.tags ?? [],
+        isChunked: false,
+        chunks: [],
         isDeleted: false,
         deletedAt: null,
         downloadCount: 0,
@@ -230,6 +233,88 @@ export async function uploadOwnedFile(params: {
     await deleteTelegramMessage(telegram.telegramMessageId, telegram.telegramChatId).catch(noop);
     throw error;
   }
+}
+
+export async function uploadOwnedChunkedFile(params: {
+  uploadId: string;
+  originalName: string;
+  mimeType: string;
+  size: number;
+  chunks: FileChunk[];
+  folderId?: string | null;
+  displayName?: string;
+  description?: string;
+  tags?: string[];
+}) {
+  const existingStore = await readStore();
+  ensureWithinQuota(existingStore.files, params.size, existingStore.settings.storageQuotaBytes);
+
+  const sortedChunks = [...params.chunks].sort((a, b) => a.index - b.index);
+
+  let finalChunks = sortedChunks;
+  try {
+    const chatId = sortedChunks[0].telegramChatId;
+    const fileIds = sortedChunks.map((c) => c.telegramFileId);
+    const sizeFormatted = (params.size / 1024 / 1024).toFixed(1);
+    const caption = `📦 ${params.originalName} (${params.chunks.length} chunks · ${sizeFormatted} MB)`;
+
+    const grouped = await groupTelegramDocuments(chatId, fileIds, caption);
+    
+    // Asynchronously scrub temporary single-message uploads
+    const oldMessageIds = sortedChunks.map((c) => c.telegramMessageId);
+    Promise.all(oldMessageIds.map((mid) => deleteTelegramMessage(mid, chatId).catch(noop)));
+
+    // Map to new message ids / file ids representing the media group album
+    finalChunks = sortedChunks.map((chunk, i) => ({
+      ...chunk,
+      telegramMessageId: grouped[i]?.message_id ?? chunk.telegramMessageId,
+      telegramFileId: grouped[i]?.file_id ?? chunk.telegramFileId,
+    }));
+  } catch (err) {
+    // Fall back to original separate chunk messages if grouping fails
+    console.error("Failed to group chunk telegram messages:", err);
+  }
+
+  const created = await mutateStore((store) => {
+    const now = new Date().toISOString();
+    const nextFile: StoredFile = {
+      id: randomUUID(),
+      originalName: params.originalName,
+      displayName: params.displayName || params.originalName,
+      description: params.description || "",
+      mimeType: params.mimeType,
+      extension: getExtension(params.originalName),
+      size: params.size,
+      category: getCategory(params.mimeType, params.originalName),
+      sha256: params.uploadId,
+      telegramFileId: finalChunks[0].telegramFileId,
+      telegramUniqueFileId: undefined,
+      telegramMessageId: finalChunks[0].telegramMessageId,
+      telegramChatId: finalChunks[0].telegramChatId,
+      folderId: params.folderId ?? null,
+      tags: params.tags ?? [],
+      isChunked: true,
+      chunks: finalChunks,
+      isDeleted: false,
+      deletedAt: null,
+      downloadCount: 0,
+      lastDownloadedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.files.unshift(nextFile);
+    return nextFile;
+  });
+
+  await createLog({
+    action: "UPLOAD",
+    status: "SUCCESS",
+    message: `Uploaded ${params.originalName} (${sortedChunks.length} chunks)`,
+    fileId: created.id,
+    metadata: { chunked: true, totalChunks: sortedChunks.length },
+  });
+
+  return { file: created, deduplicated: false };
 }
 
 export async function updateFile(id: string, partial: Partial<StoredFile>) {
@@ -267,7 +352,15 @@ export async function softDeleteFile(file: StoredFile) {
 }
 
 export async function hardDeleteFile(file: StoredFile) {
-  await deleteTelegramMessage(file.telegramMessageId, file.telegramChatId).catch(noop);
+  if (file.isChunked && file.chunks?.length) {
+    await Promise.all(
+      file.chunks.map((chunk) =>
+        deleteTelegramMessage(chunk.telegramMessageId, chunk.telegramChatId).catch(noop),
+      ),
+    );
+  } else {
+    await deleteTelegramMessage(file.telegramMessageId, file.telegramChatId).catch(noop);
+  }
   await mutateStore((store) => {
     store.files = store.files.filter((item) => item.id !== file.id);
     store.shares = store.shares.filter((item) => item.fileId !== file.id);
@@ -370,3 +463,59 @@ export async function incrementShareDownload(shareId: string) {
 }
 
 export { buildPublicLink };
+
+export async function createFileDownloadResponse(file: StoredFile) {
+  // Non-chunked: redirect to Telegram URL directly
+  if (!file.isChunked || !file.chunks?.length) {
+    const url = await resolveDownloadUrl(file);
+    return Response.redirect(url, 302);
+  }
+
+  // Chunked: fetch all chunks from Telegram and stream them joined
+  const sortedChunks = [...file.chunks].sort((a, b) => a.index - b.index);
+
+  let chunkIndex = 0;
+  let currentReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        if (!currentReader) {
+          if (chunkIndex >= sortedChunks.length) {
+            controller.close();
+            return;
+          }
+          // Fetch URL lazily when we actually need the chunk
+          const url = await getTelegramFileDownloadUrl(sortedChunks[chunkIndex].telegramFileId);
+          const response = await fetch(url);
+          if (!response.ok || !response.body) {
+            throw new Error(`Failed to fetch chunk ${chunkIndex} from Telegram`);
+          }
+          currentReader = response.body.getReader();
+        }
+
+        const { done, value } = await currentReader.read();
+        if (done) {
+          currentReader = null;
+          chunkIndex++;
+          // immediately trigger next pull recursively
+          return this.pull!(controller);
+        }
+
+        controller.enqueue(value);
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+  });
+
+  const encodedName = encodeURIComponent(file.originalName);
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": file.mimeType || "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${file.originalName}"; filename*=UTF-8''${encodedName}`,
+      "Content-Length": file.size.toString(),
+    },
+  });
+}
