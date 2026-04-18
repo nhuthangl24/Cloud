@@ -22,7 +22,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-const CHUNK_SIZE = 35 * 1024 * 1024; // 35 MB per chunk
+const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB per chunk
 
 type FolderOption = {
   id: string;
@@ -195,7 +195,7 @@ export function UploadModal() {
     return currentParentId;
   }
 
-  /** Small file (≤ 45 MB) — single XHR with real upload progress */
+  /** Small file — single XHR with real upload progress */
   async function uploadSingleFile(entry: QueuedUpload, targetFolderId: string | null) {
     const formData = new FormData();
     formData.append("files", entry.file);
@@ -214,43 +214,60 @@ export function UploadModal() {
     return result;
   }
 
-  /** Large file (> 45 MB) — chunk-by-chunk with real per-chunk progress */
+  /** Large file — chunk-by-chunk with real per-chunk progress */
   async function uploadChunkedFile(entry: QueuedUpload, targetFolderId: string | null) {
     const uploadId = crypto.randomUUID();
     const totalChunks = Math.ceil(entry.file.size / CHUNK_SIZE);
-    const chunkResults: ChunkResult[] = [];
+    
+    const chunkResults: ChunkResult[] = new Array(totalChunks).fill(null);
+    const chunkProgresses: number[] = new Array(totalChunks).fill(0);
 
-
-
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, entry.file.size);
-      const slice = entry.file.slice(start, end);
-      const chunkFile = new File(
-        [slice],
-        `${entry.file.name}.part${String(i).padStart(4, "0")}`,
-        { type: "application/octet-stream" },
+    const updateCombinedProgress = () => {
+      const overallPct = Math.round(
+        chunkProgresses.reduce((sum, p) => sum + p, 0) / totalChunks
       );
+      updateItem(entry.id, {
+        progress: overallPct,
+        statusText: `Uploading chunks… ${overallPct}%`,
+      });
+    };
 
-      const formData = new FormData();
-      formData.append("chunk", chunkFile);
-      formData.append("chunkIndex", String(i));
-      formData.append("totalChunks", String(totalChunks));
-      formData.append("uploadId", uploadId);
+    let currentIndex = 0;
+    const maxConcurrent = 10; // Đẩy lên 10 để bào tối đa băng thông nhờ Multi-Bot
 
-      // Base progress from completed chunks, plus live progress of current chunk
-      const baseProgress = Math.round((i / totalChunks) * 90);
-      const chunkWeight = 90 / totalChunks;
+    const uploadWorker = async () => {
+      while (currentIndex < totalChunks) {
+        const i = currentIndex++;
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, entry.file.size);
+        const slice = entry.file.slice(start, end);
+        const chunkFile = new File(
+          [slice],
+          `${entry.file.name}.part${String(i).padStart(4, "0")}`,
+          { type: "application/octet-stream" },
+        );
 
-      const data = await xhrUpload("/api/files/upload-chunk", formData, {}, (pct) => {
-        updateItem(entry.id, {
-          progress: Math.round(baseProgress + (pct / 100) * chunkWeight),
-          statusText: `Chunk ${i + 1} / ${totalChunks} — ${pct}%`,
-        });
-      }) as { success: boolean; error?: string; data?: ChunkResult };
+        const formData = new FormData();
+        formData.append("chunk", chunkFile);
+        formData.append("chunkIndex", String(i));
+        formData.append("totalChunks", String(totalChunks));
+        formData.append("uploadId", uploadId);
 
-      if (!data.success) throw new Error(data.error ?? `Chunk ${i + 1} failed`);
-      chunkResults.push(data.data!);
+        const data = await xhrUpload("/api/files/upload-chunk", formData, {}, (pct) => {
+          chunkProgresses[i] = pct * 0.9; // 90% goes to chunk uploads
+          updateCombinedProgress();
+        }) as { success: boolean; error?: string; data?: ChunkResult };
+
+        if (!data.success) throw new Error(data.error ?? `Chunk ${i + 1} failed`);
+        chunkResults[i] = data.data!;
+      }
+    };
+
+    const workers = Array.from({ length: Math.min(maxConcurrent, totalChunks) }, uploadWorker);
+    await Promise.all(workers);
+
+    if (chunkResults.includes(null as any)) {
+      throw new Error("Some chunks missing");
     }
 
     updateItem(entry.id, { progress: 92, statusText: "Finalizing…" });
@@ -267,8 +284,6 @@ export function UploadModal() {
         folderId: targetFolderId,
       }),
     });
-
-
 
     const finalData = await res.json();
     if (!finalData.success) throw new Error(finalData.error ?? "Finalize failed");
@@ -342,7 +357,7 @@ export function UploadModal() {
         <DialogHeader>
           <DialogTitle>Upload To Telegram Storage</DialogTitle>
           <DialogDescription>
-            File &gt; 35 MB sẽ tự động chia chunk và ghép lại khi tải xuống.
+            File &gt; 4 MB sẽ tự động chia chunk và ghép lại khi tải xuống. (Tăng tốc độ tải lên đồng thời)
           </DialogDescription>
         </DialogHeader>
 
