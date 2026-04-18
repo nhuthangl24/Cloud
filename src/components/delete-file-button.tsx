@@ -1,7 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Trash2 } from "lucide-react";
+import { Trash2, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 export function DeleteFileButton({
@@ -12,13 +13,19 @@ export function DeleteFileButton({
   permanent?: boolean;
 }) {
   const router = useRouter();
+  const [isDeleting, setIsDeleting] = useState(false);
 
   async function onDelete() {
-    await fetch(`/api/files/${fileId}?permanent=${permanent ? "true" : "false"}`, {
-      method: "DELETE",
-    });
-    router.push("/dashboard/files");
-    router.refresh();
+    setIsDeleting(true);
+    try {
+      await fetch(`/api/files/${fileId}?permanent=${permanent ? "true" : "false"}`, {
+        method: "DELETE",
+      });
+      router.push("/dashboard/files");
+      router.refresh();
+    } catch {
+      setIsDeleting(false);
+    }
   }
 
   return (
@@ -26,10 +33,11 @@ export function DeleteFileButton({
       variant="outline"
       size="icon"
       onClick={onDelete}
+      disabled={isDeleting}
       aria-label={permanent ? "Hard delete file" : "Soft delete file"}
       title={permanent ? "Hard delete file" : "Soft delete file"}
     >
-      <Trash2 className="h-4 w-4" />
+      {isDeleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
     </Button>
   );
 }

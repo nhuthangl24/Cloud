@@ -266,7 +266,7 @@ export function UploadModal() {
     const workers = Array.from({ length: Math.min(maxConcurrent, totalChunks) }, uploadWorker);
     await Promise.all(workers);
 
-    if (chunkResults.includes(null as any)) {
+    if (chunkResults.some((res) => res === null)) {
       throw new Error("Some chunks missing");
     }
 
