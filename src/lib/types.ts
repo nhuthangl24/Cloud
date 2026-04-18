@@ -87,6 +87,9 @@ export type AppSettings = {
   allowedMimeTypes: string[];
   storageQuotaBytes: number;
   privateLinksOnly: boolean;
+  telegramTokens: string[];
+  telegramChatId: string;
+  chunkSize: number;
 };
 
 export type LocalStore = {

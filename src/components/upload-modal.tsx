@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, FileUp, FolderUp, Loader2, UploadCloud, X, XCircle } from "lucide-react";
 import { useDropzone } from "react-dropzone";
 import {
@@ -21,99 +20,26 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB per chunk
-
-type FolderOption = {
-  id: string;
-  name: string;
-  path: string;
-  parentId: string | null;
-};
-
-type QueuedUpload = {
-  id: string;
-  file: File;
-  label: string;
-  relativePath: string | null;
-};
-
-type UploadItem = {
-  id: string;
-  name: string;
-  size: number;
-  progress: number; // 0–100
-  status: "queued" | "uploading" | "success" | "error";
-  statusText?: string;
-  error?: string;
-};
-
-type ChunkResult = {
-  index: number;
-  telegramFileId: string;
-  telegramMessageId: number;
-  telegramChatId: string;
-  size: number;
-};
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
-
-/** XHR upload with real progress events */
-function xhrUpload(
-  url: string,
-  body: FormData | string,
-  headers: Record<string, string> = {},
-  onProgress?: (pct: number) => void,
-): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) {
-        onProgress(Math.round((e.loaded / e.total) * 100));
-      }
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch {
-          resolve(xhr.responseText);
-        }
-      } else {
-        try {
-          const err = JSON.parse(xhr.responseText);
-          reject(new Error(err.error ?? `HTTP ${xhr.status}`));
-        } catch {
-          reject(new Error(`HTTP ${xhr.status}`));
-        }
-      }
-    };
-
-    xhr.onerror = () => reject(new Error("Network error"));
-    xhr.ontimeout = () => reject(new Error("Request timed out"));
-
-    xhr.open("POST", url);
-    Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
-    xhr.send(body);
-  });
-}
+import { useUpload } from "@/components/providers/upload-provider";
 
 export function UploadModal() {
-  const router = useRouter();
   const folderInputRef = useRef<HTMLInputElement>(null);
   const [open, setOpen] = useState(false);
-  const [queuedUploads, setQueuedUploads] = useState<QueuedUpload[]>([]);
-  const [items, setItems] = useState<UploadItem[]>([]);
-  const [submitting, setSubmitting] = useState(false);
-  const [folders, setFolders] = useState<FolderOption[]>([]);
-  const [folderId, setFolderId] = useState<string>("root");
+  
+  const {
+    items,
+    queuedUploads,
+    submitting,
+    folders,
+    folderId,
+    setFolderId,
+    queueFiles,
+    removeFile,
+    handleUpload,
+    fetchFolders,
+    totalProgress,
+    clearCompleted,
+  } = useUpload();
 
   useEffect(() => {
     const input = folderInputRef.current;
@@ -123,227 +49,22 @@ export function UploadModal() {
   }, []);
 
   useEffect(() => {
-    if (!open) return;
-    fetch("/api/folders")
-      .then((res) => res.json())
-      .then((payload) => { if (payload.success) setFolders(payload.data); })
-      .catch(() => null);
+    if (open) {
+      fetchFolders();
+    } else {
+      clearCompleted();
+    }
+    // fetchFolders and clearCompleted are stable context functions — no need as deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  function queueFiles(acceptedFiles: File[]) {
-    if (acceptedFiles.length === 0) return;
-    const nextUploads = acceptedFiles.map((file) => {
-      const df = file as File & { webkitRelativePath?: string };
-      const relativePath = df.webkitRelativePath?.trim() || null;
-      return { id: crypto.randomUUID(), file, label: relativePath || file.name, relativePath };
-    });
-
-    setOpen(true);
-    setQueuedUploads((prev) => [...prev, ...nextUploads]);
-    setItems((prev) => [
-      ...prev,
-      ...nextUploads.map((entry) => ({
-        id: entry.id,
-        name: entry.label,
-        size: entry.file.size,
-        progress: 0,
-        status: "queued" as const,
-        statusText: entry.file.size > CHUNK_SIZE
-          ? `${Math.ceil(entry.file.size / CHUNK_SIZE)} chunks · ${formatBytes(entry.file.size)}`
-          : formatBytes(entry.file.size),
-      })),
-    ]);
-  }
-
   const { getRootProps, getInputProps, isDragActive, open: openPicker } = useDropzone({
-    onDrop: queueFiles,
+    onDrop: (files) => {
+      queueFiles(files);
+      setOpen(true);
+    },
     noClick: true,
   });
-
-  const totalProgress = useMemo(() => {
-    if (items.length === 0) return 0;
-    return Math.round(items.reduce((sum, i) => sum + i.progress, 0) / items.length);
-  }, [items]);
-
-  function updateItem(id: string, patch: Partial<UploadItem>) {
-    setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
-  }
-
-  async function createFolder(name: string, parentId: string | null) {
-    const res = await fetch("/api/folders", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, parentId }),
-    });
-    const payload = await res.json();
-    if (!payload.success) throw new Error(payload.error ?? `Cannot create folder ${name}`);
-    return payload.data as FolderOption;
-  }
-
-  async function ensureTargetFolder(relativePath: string | null, folderCache: FolderOption[]) {
-    let currentParentId = folderId === "root" ? null : folderId;
-    if (!relativePath) return currentParentId;
-    const segments = relativePath.split("/").slice(0, -1).filter(Boolean);
-    for (const segment of segments) {
-      let folder = folderCache.find((f) => f.parentId === currentParentId && f.name === segment);
-      if (!folder) {
-        folder = await createFolder(segment, currentParentId);
-        folderCache.push(folder);
-      }
-      currentParentId = folder.id;
-    }
-    return currentParentId;
-  }
-
-  /** Small file — single XHR with real upload progress */
-  async function uploadSingleFile(entry: QueuedUpload, targetFolderId: string | null) {
-    const formData = new FormData();
-    formData.append("files", entry.file);
-    if (targetFolderId) formData.append("folderId:0", targetFolderId);
-
-    const payload = await xhrUpload("/api/files/upload", formData, {}, (pct) => {
-      updateItem(entry.id, {
-        progress: pct,
-        statusText: `Uploading… ${pct}%`,
-      });
-    }) as { success: boolean; error?: string; data?: { index: number; status: string; error?: string }[] };
-
-    if (!payload.success) throw new Error(payload.error ?? "Upload failed");
-    const result = payload.data?.[0];
-    if (result?.status === "error") throw new Error(result.error ?? "Upload failed");
-    return result;
-  }
-
-  /** Large file — chunk-by-chunk with real per-chunk progress */
-  async function uploadChunkedFile(entry: QueuedUpload, targetFolderId: string | null) {
-    const uploadId = crypto.randomUUID();
-    const totalChunks = Math.ceil(entry.file.size / CHUNK_SIZE);
-    
-    const chunkResults: ChunkResult[] = new Array(totalChunks).fill(null);
-    const chunkProgresses: number[] = new Array(totalChunks).fill(0);
-
-    const updateCombinedProgress = () => {
-      const overallPct = Math.round(
-        chunkProgresses.reduce((sum, p) => sum + p, 0) / totalChunks
-      );
-      updateItem(entry.id, {
-        progress: overallPct,
-        statusText: `Uploading chunks… ${overallPct}%`,
-      });
-    };
-
-    let currentIndex = 0;
-    const maxConcurrent = 10; // Đẩy lên 10 để bào tối đa băng thông nhờ Multi-Bot
-
-    const uploadWorker = async () => {
-      while (currentIndex < totalChunks) {
-        const i = currentIndex++;
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, entry.file.size);
-        const slice = entry.file.slice(start, end);
-        const chunkFile = new File(
-          [slice],
-          `${entry.file.name}.part${String(i).padStart(4, "0")}`,
-          { type: "application/octet-stream" },
-        );
-
-        const formData = new FormData();
-        formData.append("chunk", chunkFile);
-        formData.append("chunkIndex", String(i));
-        formData.append("totalChunks", String(totalChunks));
-        formData.append("uploadId", uploadId);
-
-        const data = await xhrUpload("/api/files/upload-chunk", formData, {}, (pct) => {
-          chunkProgresses[i] = pct * 0.9; // 90% goes to chunk uploads
-          updateCombinedProgress();
-        }) as { success: boolean; error?: string; data?: ChunkResult };
-
-        if (!data.success) throw new Error(data.error ?? `Chunk ${i + 1} failed`);
-        chunkResults[i] = data.data!;
-      }
-    };
-
-    const workers = Array.from({ length: Math.min(maxConcurrent, totalChunks) }, uploadWorker);
-    await Promise.all(workers);
-
-    if (chunkResults.some((res) => res === null)) {
-      throw new Error("Some chunks missing");
-    }
-
-    updateItem(entry.id, { progress: 92, statusText: "Finalizing…" });
-
-    const res = await fetch("/api/files/finalize-chunked", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        uploadId,
-        originalName: entry.file.name,
-        mimeType: entry.file.type || "application/octet-stream",
-        size: entry.file.size,
-        chunks: chunkResults,
-        folderId: targetFolderId,
-      }),
-    });
-
-    const finalData = await res.json();
-    if (!finalData.success) throw new Error(finalData.error ?? "Finalize failed");
-    return finalData.data;
-  }
-
-  async function handleUpload() {
-    if (queuedUploads.length === 0 || submitting) return;
-    setSubmitting(true);
-
-    try {
-      const folderCache = [...folders];
-
-      for (const entry of queuedUploads) {
-        try {
-          updateItem(entry.id, { status: "uploading", progress: 0, statusText: "Starting…" });
-          const targetFolderId = await ensureTargetFolder(entry.relativePath, folderCache);
-
-          if (entry.file.size > CHUNK_SIZE) {
-            await uploadChunkedFile(entry, targetFolderId);
-          } else {
-            await uploadSingleFile(entry, targetFolderId);
-          }
-
-          updateItem(entry.id, { status: "success", progress: 100, statusText: "Done ✓" });
-        } catch (err) {
-          updateItem(entry.id, {
-            status: "error",
-            progress: 0,
-            statusText: undefined,
-            error: err instanceof Error ? err.message : "Upload failed",
-          });
-        }
-      }
-
-      setFolders(folderCache);
-      router.refresh();
-
-      setItems((current) => {
-        const hasError = current.some((i) => i.status === "error");
-        if (!hasError) {
-          setTimeout(() => {
-            setQueuedUploads([]);
-            setItems([]);
-            setFolderId("root");
-            setOpen(false);
-          }, 1000);
-        }
-        return current;
-      });
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  function removeFile(id: string) {
-    if (submitting) return;
-    setQueuedUploads((prev) => prev.filter((e) => e.id !== id));
-    setItems((prev) => prev.filter((i) => i.id !== id));
-  }
 
   const doneCount = items.filter((i) => i.status === "success").length;
   const errorCount = items.filter((i) => i.status === "error").length;
@@ -357,7 +78,7 @@ export function UploadModal() {
         <DialogHeader>
           <DialogTitle>Upload To Telegram Storage</DialogTitle>
           <DialogDescription>
-            File &gt; 4 MB sẽ tự động chia chunk và ghép lại khi tải xuống. (Tăng tốc độ tải lên đồng thời)
+            Tải lên chạy nền. Bạn có thể thu nhỏ cửa sổ này và xem tiến trình ngoài bảng.
           </DialogDescription>
         </DialogHeader>
 
@@ -485,8 +206,8 @@ export function UploadModal() {
               ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Uploading…</>
               : <><FileUp className="mr-2 h-4 w-4" />Upload</>}
           </Button>
-          <Button variant="outline" onClick={() => setOpen(false)} disabled={submitting}>
-            Close
+          <Button variant="outline" onClick={() => setOpen(false)}>
+            {submitting ? 'Hide (Run in Background)' : 'Close'}
           </Button>
         </div>
       </DialogContent>

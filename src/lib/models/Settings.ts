@@ -11,6 +11,9 @@ const SettingsSchema = new Schema<AppSettings & { docId: string }>(
     allowedMimeTypes: { type: [String], required: true },
     storageQuotaBytes: { type: Number, required: true },
     privateLinksOnly: { type: Boolean, required: true },
+    telegramTokens: { type: [String], required: true },
+    telegramChatId: { type: String, required: true },
+    chunkSize: { type: Number, required: true },
   },
   {},
 );

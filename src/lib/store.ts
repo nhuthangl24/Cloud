@@ -12,6 +12,11 @@ const defaultSettings = {
   allowedMimeTypes: env.ALLOWED_MIME_TYPES.split(",").map((item) => item.trim()),
   storageQuotaBytes: Number(env.DEFAULT_STORAGE_QUOTA),
   privateLinksOnly: env.PRIVATE_LINKS_ONLY === "true",
+  telegramTokens: env.TELEGRAM_BOT_TOKENS
+    ? env.TELEGRAM_BOT_TOKENS.split(",").map((t) => t.trim()).filter(Boolean)
+    : [env.TELEGRAM_BOT_TOKEN],
+  telegramChatId: env.TELEGRAM_STORAGE_CHAT_ID,
+  chunkSize: 19 * 1024 * 1024, // 19 MB default
 };
 
 async function ensureSettings() {
@@ -36,10 +41,15 @@ export async function readStore(): Promise<LocalStore> {
 
   const settings = settingsDoc
     ? {
-        maxFileSize: settingsDoc.maxFileSize,
-        allowedMimeTypes: settingsDoc.allowedMimeTypes,
-        storageQuotaBytes: settingsDoc.storageQuotaBytes,
-        privateLinksOnly: settingsDoc.privateLinksOnly,
+        maxFileSize: settingsDoc.maxFileSize ?? defaultSettings.maxFileSize,
+        allowedMimeTypes: settingsDoc.allowedMimeTypes ?? defaultSettings.allowedMimeTypes,
+        storageQuotaBytes: settingsDoc.storageQuotaBytes ?? defaultSettings.storageQuotaBytes,
+        privateLinksOnly: settingsDoc.privateLinksOnly ?? defaultSettings.privateLinksOnly,
+        telegramTokens: settingsDoc.telegramTokens && settingsDoc.telegramTokens.length > 0 
+          ? settingsDoc.telegramTokens 
+          : defaultSettings.telegramTokens,
+        telegramChatId: settingsDoc.telegramChatId ?? defaultSettings.telegramChatId,
+        chunkSize: settingsDoc.chunkSize ?? defaultSettings.chunkSize,
       }
     : defaultSettings;
 

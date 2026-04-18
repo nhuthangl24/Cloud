@@ -23,4 +23,7 @@ export const settingsSchema = z.object({
   allowedMimeTypes: z.array(z.string()).optional(),
   storageQuotaBytes: z.number().int().positive().optional(),
   privateLinksOnly: z.boolean().optional(),
+  telegramTokens: z.array(z.string()).optional(),
+  telegramChatId: z.string().optional(),
+  chunkSize: z.number().int().positive().max(19 * 1024 * 1024).optional(),
 });

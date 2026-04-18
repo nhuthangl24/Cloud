@@ -417,7 +417,7 @@ export async function createShareLink(
     const next: ShareRecord = {
       id: randomUUID(),
       fileId,
-      token: randomBytes(18).toString("hex"),
+      token: `${Date.now().toString(36)}${randomBytes(48).toString("hex")}`,
       expiresAt: input.expiresAt ?? null,
       maxDownloads: input.maxDownloads ?? null,
       downloadCount: 0,
@@ -519,3 +519,62 @@ export async function createFileDownloadResponse(file: StoredFile) {
     },
   });
 }
+
+export async function uploadOwnedSingleFileP2P(params: {
+  originalName: string;
+  mimeType: string;
+  size: number;
+  telegramFileId: string;
+  telegramMessageId: number;
+  telegramChatId: string;
+  folderId?: string | null;
+  displayName?: string;
+  description?: string;
+  tags?: string[];
+  uploadId: string;
+}) {
+  const existingStore = await readStore();
+  ensureWithinQuota(existingStore.files, params.size, existingStore.settings.storageQuotaBytes);
+
+  const created = await mutateStore((store) => {
+    const now = new Date().toISOString();
+    const nextFile: StoredFile = {
+      id: randomUUID(),
+      originalName: params.originalName,
+      displayName: params.displayName || params.originalName,
+      description: params.description || "",
+      mimeType: params.mimeType,
+      extension: getExtension(params.originalName),
+      size: params.size,
+      category: getCategory(params.mimeType, params.originalName),
+      sha256: params.uploadId,
+      telegramFileId: params.telegramFileId,
+      telegramUniqueFileId: undefined,
+      telegramMessageId: params.telegramMessageId,
+      telegramChatId: params.telegramChatId,
+      folderId: params.folderId ?? null,
+      tags: params.tags ?? [],
+      isChunked: false,
+      chunks: [],
+      isDeleted: false,
+      deletedAt: null,
+      downloadCount: 0,
+      lastDownloadedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.files.unshift(nextFile);
+    return nextFile;
+  });
+
+  await createLog({
+    action: "UPLOAD",
+    status: "SUCCESS",
+    message: `Uploaded ${params.originalName} via P2P`,
+    fileId: created.id,
+    metadata: { p2p: true },
+  });
+
+  return { file: created, deduplicated: false };
+}
+

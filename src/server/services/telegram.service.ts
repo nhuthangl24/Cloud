@@ -1,17 +1,18 @@
-import { env } from "@/lib/env";
+import { getSystemSettings } from "@/server/services/settings.service";
 
-export function getBotTokens(): string[] {
-  if (env.TELEGRAM_BOT_TOKENS) {
-    const list = env.TELEGRAM_BOT_TOKENS.split(",").map((s) => s.trim()).filter(Boolean);
-    if (list.length > 0) return list;
-  }
-  return [env.TELEGRAM_BOT_TOKEN];
+export async function getBotTokens(): Promise<string[]> {
+  const settings = await getSystemSettings();
+  return settings.telegramTokens && settings.telegramTokens.length > 0 
+    ? settings.telegramTokens 
+    : [];
 }
 
 let roundRobinIndex = 0;
 
-export function getNextBotToken(): { token: string; index: number } {
-  const tokens = getBotTokens();
+export async function getNextBotToken(): Promise<{ token: string; index: number }> {
+  const tokens = await getBotTokens();
+  if (tokens.length === 0) throw new Error("No Telegram bots configured");
+  
   const index = roundRobinIndex % tokens.length;
   roundRobinIndex++;
   return { token: tokens[index], index };
@@ -30,7 +31,13 @@ async function telegramFetch<T>(
   retries = 3,
   token?: string,
 ): Promise<T> {
-  const actualToken = token || env.TELEGRAM_BOT_TOKEN;
+  let actualToken = token;
+  if (!actualToken) {
+     const tokens = await getBotTokens();
+     actualToken = tokens[0];
+  }
+  if (!actualToken) throw new Error("No Telegram Bot token provided");
+
   const response = await fetch(`https://api.telegram.org/bot${actualToken}${endpoint}`, init);
   const data = await response.json().catch(() => ({ ok: false, description: "Invalid JSON response" }));
   if (!response.ok || !data.ok) {
@@ -48,9 +55,11 @@ async function telegramFetch<T>(
 export async function uploadFileToTelegram(
   file: File,
 ): Promise<TelegramUploadResult> {
-  const { token, index } = getNextBotToken();
+  const { token, index } = await getNextBotToken();
+  const settings = await getSystemSettings();
+  
   const formData = new FormData();
-  formData.append("chat_id", env.TELEGRAM_STORAGE_CHAT_ID);
+  formData.append("chat_id", settings.telegramChatId);
   formData.append("caption", `Cloud Nhu Thang: ${file.name}`);
   formData.append("document", file);
 
@@ -73,8 +82,9 @@ export async function uploadFileToTelegram(
     throw new Error("Telegram did not return file_id");
   }
 
+  const tokens = await getBotTokens();
   return {
-    telegramFileId: getBotTokens().length > 1 ? `${index}|${filePayload.file_id}` : filePayload.file_id,
+    telegramFileId: tokens.length > 1 ? `${index}|${filePayload.file_id}` : filePayload.file_id,
     telegramUniqueFileId: filePayload.file_unique_id,
     telegramMessageId: result.message_id,
     telegramChatId: String(result.chat.id),
@@ -83,10 +93,11 @@ export async function uploadFileToTelegram(
 
 export async function getTelegramFilePath(rawFileId: string) {
   let fileId = rawFileId;
-  let token = env.TELEGRAM_BOT_TOKEN;
+  const tokens = await getBotTokens();
+  let token = tokens[0] || "";
+  
   if (rawFileId.includes("|")) {
     const parts = rawFileId.split("|", 2);
-    const tokens = getBotTokens();
     const idx = parseInt(parts[0], 10);
     if (!isNaN(idx) && tokens[idx]) {
       token = tokens[idx];
@@ -121,16 +132,19 @@ export async function deleteTelegramMessage(messageId: number, chatId: string) {
 
 export async function telegramHealthCheck() {
   const me = await telegramFetch<{ id: number; username: string }>("/getMe");
+  const settings = await getSystemSettings();
+  
   return {
     ok: true,
     botId: me.id,
     username: me.username,
-    storageChatId: env.TELEGRAM_STORAGE_CHAT_ID,
+    storageChatId: settings.telegramChatId,
   };
 }
 
 export async function telegramSendTestMessage(customChatId?: string) {
-  const chatId = customChatId || env.TELEGRAM_STORAGE_CHAT_ID;
+  const settings = await getSystemSettings();
+  const chatId = customChatId || settings.telegramChatId;
   const result = await telegramFetch<{
     message_id: number;
     chat: { id: string | number; type: string; title?: string };
@@ -156,11 +170,12 @@ export async function telegramSendTestMessage(customChatId?: string) {
 }
 
 export async function sendTelegramLogMessage(text: string) {
+  const settings = await getSystemSettings();
   const result = await telegramFetch<{ message_id: number }>("/sendMessage", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      chat_id: env.TELEGRAM_STORAGE_CHAT_ID,
+      chat_id: settings.telegramChatId,
       text,
     }),
   });
@@ -168,7 +183,8 @@ export async function sendTelegramLogMessage(text: string) {
 }
 
 export async function groupTelegramDocuments(chatId: string, fileIds: string[], caption?: string) {
-  if (getBotTokens().length > 1) return []; // Cannot group cleanly across multiple bots
+  const tokens = await getBotTokens();
+  if (tokens.length > 1) return []; // Cannot group cleanly across multiple bots
 
   // Telegram allows max 10 media per group. We chunk the requests if there are more.
   const results: Array<{ message_id: number; file_id: string }> = [];
