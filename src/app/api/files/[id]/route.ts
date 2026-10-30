@@ -1,4 +1,5 @@
 import { ok, fromError } from "@/lib/http";
+import { requireServerSession } from "@/lib/auth";
 import { fileUpdateSchema } from "@/lib/validators";
 import { getFileById, hardDeleteFile, softDeleteFile, updateFile } from "@/server/services/file.service";
 
@@ -6,6 +7,7 @@ type RouteContext = { params: Promise<{ id: string }> };
 
 export async function GET(_: Request, context: RouteContext) {
   try {
+    await requireServerSession();
     const { id } = await context.params;
     const file = await getFileById(id);
     return ok(file);
@@ -16,6 +18,7 @@ export async function GET(_: Request, context: RouteContext) {
 
 export async function PATCH(request: Request, context: RouteContext) {
   try {
+    await requireServerSession();
     const { id } = await context.params;
     const body = fileUpdateSchema.parse(await request.json());
     const updated = await updateFile(id, body);
@@ -27,6 +30,7 @@ export async function PATCH(request: Request, context: RouteContext) {
 
 export async function DELETE(request: Request, context: RouteContext) {
   try {
+    await requireServerSession();
     const { id } = await context.params;
     const { searchParams } = new URL(request.url);
     const permanent = searchParams.get("permanent") === "true";

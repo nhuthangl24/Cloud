@@ -1,8 +1,11 @@
 import { fail, fromError, ok } from "@/lib/http";
+import { requireServerSession } from "@/lib/auth";
 import { uploadOwnedSingleFileP2P } from "@/server/services/file.service";
 
 export async function POST(request: Request) {
   try {
+    await requireServerSession();
+
     const body = await request.json();
     const { 
       uploadId, originalName, mimeType, size, folderId, displayName, description, tags, 
@@ -21,7 +24,7 @@ export async function POST(request: Request) {
       telegramChatId: string;
     };
 
-    if (!uploadId || !originalName || !telegramFileId || typeof telegramMessageId !== 'number' || !telegramChatId) {
+    if (!uploadId || !originalName || !telegramFileId || typeof telegramMessageId !== "number" || !telegramChatId) {
       return fail("Missing required fields: uploadId, originalName, telegram attributes");
     }
 
@@ -36,7 +39,7 @@ export async function POST(request: Request) {
       tags,
       telegramFileId,
       telegramMessageId,
-      telegramChatId
+      telegramChatId,
     });
 
     return ok(result);

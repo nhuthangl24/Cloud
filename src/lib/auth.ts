@@ -108,6 +108,12 @@ export async function getServerSession() {
 
 export async function requireServerSession() {
   const session = await getServerSession();
+  if (!session) throw new Error("UNAUTHORIZED");
+  return session;
+}
+
+export async function requireServerSessionOrRedirect() {
+  const session = await getServerSession();
   if (!session) redirect("/login");
   return session;
 }

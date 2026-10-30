@@ -1,7 +1,6 @@
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { getFileByShareToken } from "@/server/services/file.service";
-import { formatBytes } from "@/lib/utils";
+import { PublicShareView } from "@/components/public-share-view";
 
 export default async function SharePage({
   params,
@@ -13,39 +12,40 @@ export default async function SharePage({
 
   if (!resolved) {
     return (
-      <main className="flex min-h-screen items-center justify-center px-6">
-        <Card className="w-full max-w-lg">
-          <CardContent className="p-10 text-center">Share link not found.</CardContent>
+      <main className="flex min-h-screen items-center justify-center p-6 bg-muted/20">
+        <Card className="w-full max-w-md border-border/80 shadow-xl">
+          <CardContent className="p-10 text-center text-sm text-muted-foreground">
+            Share link not found or file has been deleted.
+          </CardContent>
         </Card>
       </main>
     );
   }
 
-  const { file } = resolved;
+  const { share, file } = resolved;
+  const isExpired = Boolean(share.expiresAt && new Date(share.expiresAt) < new Date());
+  const isLimitReached = Boolean(share.maxDownloads && share.downloadCount >= share.maxDownloads);
 
   return (
-    <main className="flex min-h-screen items-center justify-center px-6">
-      <Card className="w-full max-w-xl">
-        <CardHeader>
-          <CardTitle>{file.displayName}</CardTitle>
-          <CardDescription>Telegram-backed download link</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-5">
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div className="rounded-2xl bg-secondary/70 p-4">
-              <div className="text-muted-foreground">Type</div>
-              <div className="mt-1 font-medium">{file.mimeType}</div>
-            </div>
-            <div className="rounded-2xl bg-secondary/70 p-4">
-              <div className="text-muted-foreground">Size</div>
-              <div className="mt-1 font-medium">{formatBytes(file.size)}</div>
-            </div>
-          </div>
-          <Button asChild className="w-full">
-            <a href={`/api/public/${token}`}>Download</a>
-          </Button>
-        </CardContent>
-      </Card>
+    <main className="flex min-h-screen items-center justify-center p-4 md:p-8 bg-muted/20">
+      <PublicShareView
+        token={token}
+        file={{
+          id: file.id,
+          displayName: file.displayName,
+          originalName: file.originalName,
+          size: file.size,
+          mimeType: file.mimeType,
+          category: file.category,
+          extension: file.extension || file.originalName.split(".").pop() || "",
+        }}
+        hasPassword={Boolean(share.password)}
+        expiresAt={share.expiresAt}
+        downloadCount={share.downloadCount}
+        maxDownloads={share.maxDownloads}
+        isExpired={isExpired}
+        isLimitReached={isLimitReached}
+      />
     </main>
   );
 }

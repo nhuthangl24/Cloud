@@ -8,11 +8,12 @@ import {
 
 type RouteContext = { params: Promise<{ token: string }> };
 
-export async function GET(request: Request, context: RouteContext) {
+async function handlePublicDownload(request: Request, context: RouteContext, isHead = false) {
   try {
     const { token } = await context.params;
     const resolved = await getFileByShareToken(token);
     if (!resolved) return fail("Invalid link", 404);
+
     const { share, file } = resolved;
     if (share.expiresAt && new Date(share.expiresAt) < new Date()) {
       return fail("Link expired", 410);
@@ -29,10 +30,36 @@ export async function GET(request: Request, context: RouteContext) {
 
     if (file.isDeleted) return fail("File unavailable", 404);
 
-    await incrementDownload(file);
-    await incrementShareDownload(share.id);
-    return await createFileDownloadResponse(file);
+    const isInline = url.searchParams.get("inline") === "1" || url.searchParams.get("preview") === "1";
+    const rangeHeader = request.headers.get("range");
+
+    if (!rangeHeader || rangeHeader.startsWith("bytes=0-")) {
+      await incrementDownload(file).catch(() => null);
+      await incrementShareDownload(share.id).catch(() => null);
+    }
+
+    const response = await createFileDownloadResponse(file, {
+      disposition: isInline ? "inline" : "attachment",
+      rangeHeader,
+    });
+
+    if (isHead) {
+      return new Response(null, {
+        status: response.status,
+        headers: response.headers,
+      });
+    }
+
+    return response;
   } catch (error) {
     return fromError(error);
   }
+}
+
+export async function GET(request: Request, context: RouteContext) {
+  return handlePublicDownload(request, context, false);
+}
+
+export async function HEAD(request: Request, context: RouteContext) {
+  return handlePublicDownload(request, context, true);
 }

@@ -1,5 +1,5 @@
 import { AppShell } from "@/components/app-shell";
-import { requireServerSession } from "@/lib/auth";
+import { requireServerSessionOrRedirect } from "@/lib/auth";
 import { readStore } from "@/lib/store";
 import { calculateUsedBytes } from "@/server/services/quota.service";
 import { UploadProvider } from "@/components/providers/upload-provider";
@@ -9,7 +9,7 @@ export default async function DashboardLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const session = await requireServerSession();
+  const session = await requireServerSessionOrRedirect();
   const store = await readStore();
 
   return (

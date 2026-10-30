@@ -37,7 +37,8 @@ async function parseSession(token: string | undefined | null) {
     const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
     const payload = JSON.parse(atob(padded)) as { username: string; exp: number };
     if (payload.exp < Date.now()) return null;
-    if (payload.username !== process.env.AUTH_USERNAME) return null;
+    const expectedUsername = process.env.AUTH_USERNAME || "admin";
+    if (payload.username !== expectedUsername) return null;
     return payload;
   } catch {
     return null;

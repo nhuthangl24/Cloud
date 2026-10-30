@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { env } from "@/lib/env";
 import { LocalStore, StoredFile, FolderRecord, ShareRecord, ActivityRecord } from "@/lib/types";
 import { connectDB } from "@/lib/mongodb";
@@ -6,6 +8,14 @@ import { FolderModel } from "@/lib/models/Folder";
 import { ShareModel } from "@/lib/models/Share";
 import { ActivityModel } from "@/lib/models/Activity";
 import { SettingsModel, SETTINGS_DOC_ID } from "@/lib/models/Settings";
+
+export function stripMongoId<T>(doc: any): T { // eslint-disable-line @typescript-eslint/no-explicit-any
+  if (!doc) return doc;
+  const copy = { ...doc };
+  delete copy.__v;
+  delete copy._id;
+  return copy as T;
+}
 
 const defaultSettings = {
   maxFileSize: Number(env.MAX_FILE_SIZE),
@@ -16,20 +26,61 @@ const defaultSettings = {
     ? env.TELEGRAM_BOT_TOKENS.split(",").map((t) => t.trim()).filter(Boolean)
     : [env.TELEGRAM_BOT_TOKEN],
   telegramChatId: env.TELEGRAM_STORAGE_CHAT_ID,
-  chunkSize: 19 * 1024 * 1024, // 19 MB default
+  chunkSize: 15 * 1024 * 1024, // 15 MB default for reliable Telegram bot getFile (< 20MB)
 };
+
+let didSeed = false;
+
+async function seedFromMetadataJsonIfEmpty() {
+  if (didSeed) return;
+  didSeed = true;
+
+  try {
+    const fileCount = await FileModel.countDocuments();
+    if (fileCount > 0) return;
+
+    const metadataPath = path.join(process.cwd(), "data", "metadata.json");
+    if (!fs.existsSync(metadataPath)) return;
+
+    const raw = fs.readFileSync(metadataPath, "utf-8");
+    const parsed = JSON.parse(raw);
+
+    if (Array.isArray(parsed.files) && parsed.files.length > 0) {
+      await FileModel.insertMany(parsed.files);
+    }
+    if (Array.isArray(parsed.folders) && parsed.folders.length > 0) {
+      await FolderModel.insertMany(parsed.folders);
+    }
+    if (Array.isArray(parsed.shares) && parsed.shares.length > 0) {
+      await ShareModel.insertMany(parsed.shares);
+    }
+    if (Array.isArray(parsed.activity) && parsed.activity.length > 0) {
+      await ActivityModel.insertMany(parsed.activity);
+    }
+    if (parsed.settings) {
+      await SettingsModel.findOneAndUpdate(
+        { docId: SETTINGS_DOC_ID },
+        { $set: { ...parsed.settings, docId: SETTINGS_DOC_ID } },
+        { upsert: true },
+      );
+    }
+  } catch (err) {
+    console.error("[store] auto-seed from metadata.json failed:", err);
+  }
+}
 
 async function ensureSettings() {
   await SettingsModel.findOneAndUpdate(
     { docId: SETTINGS_DOC_ID },
     { $setOnInsert: { docId: SETTINGS_DOC_ID, ...defaultSettings } },
-    { upsert: true, returnDocument: 'after' },
+    { upsert: true, returnDocument: "after" },
   );
 }
 
 export async function readStore(): Promise<LocalStore> {
   await connectDB();
   await ensureSettings();
+  await seedFromMetadataJsonIfEmpty();
 
   const [files, folders, shares, activity, settingsDoc] = await Promise.all([
     FileModel.find({}).sort({ createdAt: -1 }).lean(),
@@ -45,9 +96,10 @@ export async function readStore(): Promise<LocalStore> {
         allowedMimeTypes: settingsDoc.allowedMimeTypes ?? defaultSettings.allowedMimeTypes,
         storageQuotaBytes: settingsDoc.storageQuotaBytes ?? defaultSettings.storageQuotaBytes,
         privateLinksOnly: settingsDoc.privateLinksOnly ?? defaultSettings.privateLinksOnly,
-        telegramTokens: settingsDoc.telegramTokens && settingsDoc.telegramTokens.length > 0 
-          ? settingsDoc.telegramTokens 
-          : defaultSettings.telegramTokens,
+        telegramTokens:
+          settingsDoc.telegramTokens && settingsDoc.telegramTokens.length > 0
+            ? settingsDoc.telegramTokens
+            : defaultSettings.telegramTokens,
         telegramChatId: settingsDoc.telegramChatId ?? defaultSettings.telegramChatId,
         chunkSize: settingsDoc.chunkSize ?? defaultSettings.chunkSize,
       }
@@ -62,15 +114,12 @@ export async function readStore(): Promise<LocalStore> {
   };
 }
 
-// writeStore is kept for API compatibility but most mutations go through
-// individual model operations. It syncs settings only; documents are written
-// directly in mutateStore.
 export async function writeStore(store: LocalStore): Promise<void> {
   await connectDB();
   await SettingsModel.findOneAndUpdate(
     { docId: SETTINGS_DOC_ID },
     { ...store.settings, docId: SETTINGS_DOC_ID },
-    { upsert: true, returnDocument: 'after' },
+    { upsert: true, returnDocument: "after" },
   );
 }
 
@@ -83,19 +132,8 @@ export async function mutateStore<T>(
   const result = await mutator(store);
   const after = snapshot(store);
 
-  // Diff and persist only what changed
   await persistDiff(before, after);
-
   return result;
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function stripMongoId<T>(doc: any): T {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { __v, _id, ...rest } = doc;
-  return rest as unknown as T;
 }
 
 function snapshot(store: LocalStore) {
@@ -108,10 +146,7 @@ function snapshot(store: LocalStore) {
   });
 }
 
-async function persistDiff(
-  before: string,
-  after: string,
-): Promise<void> {
+async function persistDiff(before: string, after: string): Promise<void> {
   if (before === after) return;
 
   const b = JSON.parse(before) as LocalStore;
@@ -131,7 +166,7 @@ async function persistDiff(
       ops.push(
         FileModel.findOneAndUpdate({ id: file.id }, file, {
           upsert: true,
-          returnDocument: 'after',
+          returnDocument: "after",
         }),
       );
     }
@@ -154,7 +189,7 @@ async function persistDiff(
       ops.push(
         FolderModel.findOneAndUpdate({ id: folder.id }, folder, {
           upsert: true,
-          returnDocument: 'after',
+          returnDocument: "after",
         }),
       );
     }
@@ -177,7 +212,7 @@ async function persistDiff(
       ops.push(
         ShareModel.findOneAndUpdate({ id: share.id }, share, {
           upsert: true,
-          returnDocument: 'after',
+          returnDocument: "after",
         }),
       );
     }
@@ -188,14 +223,13 @@ async function persistDiff(
     }
   }
 
-  // Activity — only add new entries (oldest are trimmed in log.service)
+  // Activity
   const beforeActivityIds = new Set(b.activity.map((a) => a.id));
   for (const entry of a.activity) {
     if (!beforeActivityIds.has(entry.id)) {
-      ops.push(ActivityModel.create(entry).catch(() => null)); // ignore dup key
+      ops.push(ActivityModel.create(entry).catch(() => null));
     }
   }
-  // Trim excess in DB if the service sliced the array
   if (a.activity.length < b.activity.length) {
     const keepIds = new Set(a.activity.map((x) => x.id));
     const toDelete = b.activity.filter((x) => !keepIds.has(x.id)).map((x) => x.id);
@@ -210,7 +244,7 @@ async function persistDiff(
       SettingsModel.findOneAndUpdate(
         { docId: SETTINGS_DOC_ID },
         { ...a.settings, docId: SETTINGS_DOC_ID },
-        { upsert: true, returnDocument: 'after' },
+        { upsert: true, returnDocument: "after" },
       ),
     );
   }

@@ -1,9 +1,12 @@
 import { fail, fromError, ok } from "@/lib/http";
+import { requireServerSession } from "@/lib/auth";
 import { uploadOwnedChunkedFile } from "@/server/services/file.service";
 import { FileChunk } from "@/lib/types";
 
 export async function POST(request: Request) {
   try {
+    await requireServerSession();
+
     const body = await request.json();
     const { uploadId, originalName, mimeType, size, chunks, folderId, displayName, description, tags } = body as {
       uploadId: string;

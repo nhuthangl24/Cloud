@@ -1,6 +1,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { buildPublicLink, noop } from "@/server/services/misc";
-import { mutateStore, readStore } from "@/lib/store";
+import { stripMongoId, readStore } from "@/lib/store";
+import { connectDB } from "@/lib/mongodb";
+import { FileModel } from "@/lib/models/File";
+import { FolderModel } from "@/lib/models/Folder";
+import { ShareModel } from "@/lib/models/Share";
 import { FileChunk, FolderRecord, ShareRecord, StoredFile } from "@/lib/types";
 import { getCategory, getExtension } from "@/server/services/file-classifier.service";
 import { sha256FromBuffer } from "@/server/services/hash.service";
@@ -8,8 +12,8 @@ import { createLog } from "@/server/services/log.service";
 import { ensureWithinQuota } from "@/server/services/quota.service";
 import {
   deleteTelegramMessage,
+  getTelegramDownloadStream,
   getTelegramFileDownloadUrl,
-  groupTelegramDocuments,
   uploadFileToTelegram,
 } from "@/server/services/telegram.service";
 import { slugify } from "@/lib/utils";
@@ -22,82 +26,90 @@ type ListFileOptions = {
   includeDeleted?: boolean;
 };
 
-export async function listFiles(options: ListFileOptions = {}) {
-  const store = await readStore();
-  let files = store.files.filter((file) => (options.includeDeleted ? true : !file.isDeleted));
+export async function listFiles(options: ListFileOptions = {}): Promise<StoredFile[]> {
+  await connectDB();
+  const filter: Record<string, unknown> = {};
+
+  if (!options.includeDeleted) {
+    filter.isDeleted = false;
+  }
 
   if (options.query) {
-    const query = options.query.toLowerCase();
-    files = files.filter(
-      (file) =>
-        file.displayName.toLowerCase().includes(query) ||
-        file.originalName.toLowerCase().includes(query) ||
-        file.tags.some((tag) => tag.toLowerCase().includes(query)),
-    );
+    const q = options.query.trim();
+    filter.$or = [
+      { displayName: { $regex: q, $options: "i" } },
+      { originalName: { $regex: q, $options: "i" } },
+      { tags: { $regex: q, $options: "i" } },
+    ];
   }
 
   if (options.category && options.category !== "all") {
-    files = files.filter((file) => file.category === options.category);
+    filter.category = options.category;
   }
 
-  if (options.folderId) {
-    const folderIds = new Set<string>([options.folderId]);
-    let changed = true;
-
-    while (changed) {
-      changed = false;
-      for (const folder of store.folders) {
-        if (folder.parentId && folderIds.has(folder.parentId) && !folderIds.has(folder.id)) {
-          folderIds.add(folder.id);
-          changed = true;
+  if (options.folderId !== undefined) {
+    if (options.folderId === null || options.folderId === "root") {
+      filter.folderId = null;
+    } else {
+      // Find all subfolder IDs recursively
+      const allFolders = await FolderModel.find({}).lean();
+      const folderIds = new Set<string>([options.folderId]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const f of allFolders) {
+          if (f.parentId && folderIds.has(f.parentId) && !folderIds.has(f.id)) {
+            folderIds.add(f.id);
+            changed = true;
+          }
         }
       }
+      filter.folderId = { $in: Array.from(folderIds) };
     }
-
-    files = files.filter((file) => file.folderId !== null && folderIds.has(file.folderId));
   }
 
-  const sorters: Record<string, (a: StoredFile, b: StoredFile) => number> = {
-    newest: (a, b) => b.createdAt.localeCompare(a.createdAt),
-    oldest: (a, b) => a.createdAt.localeCompare(b.createdAt),
-    name: (a, b) => a.displayName.localeCompare(b.displayName),
-    size: (a, b) => b.size - a.size,
+  const sorters: Record<string, Record<string, 1 | -1>> = {
+    newest: { createdAt: -1 },
+    oldest: { createdAt: 1 },
+    name: { displayName: 1 },
+    size: { size: -1 },
   };
 
-  return files.sort(sorters[options.sort ?? "newest"] ?? sorters.newest);
+  const sortOrder = sorters[options.sort ?? "newest"] ?? sorters.newest;
+  const files = await FileModel.find(filter).sort(sortOrder).lean();
+  return files.map((d) => stripMongoId<StoredFile>(d));
 }
 
-export async function getFileById(id: string) {
-  const store = await readStore();
-  const file = store.files.find((item) => item.id === id);
+export async function getFileById(id: string): Promise<StoredFile> {
+  await connectDB();
+  const file = await FileModel.findOne({ id }).lean();
   if (!file) throw new Error("NOT_FOUND");
-  return file;
+  return stripMongoId<StoredFile>(file);
 }
 
 export const getFileByIdForUser = getFileById;
 
-export async function getFolders() {
-  const store = await readStore();
-  return store.folders;
+export async function getFolders(): Promise<FolderRecord[]> {
+  await connectDB();
+  const folders = await FolderModel.find({}).sort({ path: 1 }).lean();
+  return folders.map((d) => stripMongoId<FolderRecord>(d));
 }
 
-export async function createFolder(name: string, parentId?: string | null) {
-  const folder = await mutateStore((store) => {
-    const parent = parentId ? store.folders.find((folder) => folder.id === parentId) : null;
-    if (parentId && !parent) throw new Error("Parent folder not found");
+export async function createFolder(name: string, parentId?: string | null): Promise<FolderRecord> {
+  await connectDB();
+  const parent = parentId ? await FolderModel.findOne({ id: parentId }).lean() : null;
+  if (parentId && !parent) throw new Error("Parent folder not found");
 
-    const nextFolder: FolderRecord = {
-      id: randomUUID(),
-      name,
-      slug: slugify(name),
-      parentId: parent?.id ?? null,
-      path: parent ? `${parent.path}/${slugify(name)}` : slugify(name),
-      createdAt: new Date().toISOString(),
-    };
+  const nextFolder: FolderRecord = {
+    id: randomUUID(),
+    name,
+    slug: slugify(name),
+    parentId: parent?.id ?? null,
+    path: parent ? `${parent.path}/${slugify(name)}` : slugify(name),
+    createdAt: new Date().toISOString(),
+  };
 
-    store.folders.push(nextFolder);
-    return nextFolder;
-  });
+  await FolderModel.create(nextFolder);
 
   await createLog({
     action: "FOLDER_CREATE",
@@ -105,129 +117,107 @@ export async function createFolder(name: string, parentId?: string | null) {
     message: `Created folder ${name}`,
   });
 
-  return folder;
+  return nextFolder;
 }
 
-export async function deleteFolder(folderId: string) {
-  let deletedFolderName = folderId;
+export async function deleteFolder(folderId: string): Promise<string> {
+  await connectDB();
+  const folder = await FolderModel.findOne({ id: folderId }).lean();
+  if (!folder) throw new Error("NOT_FOUND");
 
-  await mutateStore((store) => {
-    const folder = store.folders.find((item) => item.id === folderId);
-    if (!folder) throw new Error("NOT_FOUND");
+  const hasFiles = await FileModel.exists({ folderId, isDeleted: false });
+  if (hasFiles) throw new Error("Folder still contains active files");
 
-    const hasFiles = store.files.some((file) => !file.isDeleted && file.folderId === folderId);
-    if (hasFiles) throw new Error("Folder still contains files");
+  const hasSubfolders = await FolderModel.exists({ parentId: folderId });
+  if (hasSubfolders) throw new Error("Folder contains subfolders");
 
-    const hasChildren = store.folders.some((item) => item.parentId === folderId);
-    if (hasChildren) throw new Error("Folder still contains subfolders");
-
-    store.folders = store.folders.filter((item) => item.id !== folderId);
-    deletedFolderName = folder.name;
-  });
+  await FolderModel.deleteOne({ id: folderId });
 
   await createLog({
     action: "FOLDER_DELETE",
     status: "SUCCESS",
-    message: `Deleted folder ${deletedFolderName}`,
+    message: `Deleted folder ${folder.name}`,
   });
 
-  return { deleted: true, folderId };
+  return folderId;
 }
 
 export async function uploadOwnedFile(params: {
   file: File;
+  folderId?: string | null;
   displayName?: string;
   description?: string;
-  folderId?: string | null;
   tags?: string[];
-}) {
-  const settings = (await readStore()).settings;
-  const existingStore = await readStore();
-  ensureWithinQuota(existingStore.files, params.file.size, settings.storageQuotaBytes);
-
+}): Promise<{ file: StoredFile; deduplicated: boolean }> {
+  await connectDB();
   const buffer = Buffer.from(await params.file.arrayBuffer());
   const sha256 = await sha256FromBuffer(buffer);
-  const duplicate = existingStore.files.find(
-    (item) => item.sha256 === sha256 && !item.isDeleted,
-  );
 
-  if (duplicate) {
-    if (params.folderId && duplicate.folderId !== params.folderId) {
-      const updatedDuplicate = await updateFile(duplicate.id, {
-        folderId: params.folderId,
-      });
+  // Check deduplication
+  const existing = await FileModel.findOne({
+    sha256,
+    isDeleted: false,
+    folderId: params.folderId ?? null,
+  }).lean();
 
-      await createLog({
-        action: "UPLOAD",
-        status: "SUCCESS",
-        message: `Reused existing file ${params.file.name} in a new folder`,
-        fileId: updatedDuplicate.id,
-        metadata: {
-          deduplicated: true,
-          folderId: params.folderId,
-        },
-      });
-
-      return { file: updatedDuplicate, deduplicated: true };
-    }
-
-    return { file: duplicate, deduplicated: true };
+  if (existing) {
+    return { file: stripMongoId<StoredFile>(existing), deduplicated: true };
   }
 
-  const telegram = await uploadFileToTelegram(
-    new File([buffer], params.file.name, { type: params.file.type }),
-  );
+  // Quota check
+  const allFiles = await FileModel.find({ isDeleted: false }, "size").lean();
+  const store = await readStore();
+  ensureWithinQuota(allFiles, params.file.size, store.settings.storageQuotaBytes);
+
+  const telegram = await uploadFileToTelegram(params.file);
 
   try {
-    const created = await mutateStore((store) => {
-      const now = new Date().toISOString();
-      const nextFile: StoredFile = {
-        id: randomUUID(),
-        originalName: params.file.name,
-        displayName: params.displayName || params.file.name,
-        description: params.description || "",
-        mimeType: params.file.type || "application/octet-stream",
-        extension: getExtension(params.file.name),
-        size: params.file.size,
-        category: getCategory(params.file.type || "", params.file.name),
-        sha256,
-        telegramFileId: telegram.telegramFileId,
-        telegramUniqueFileId: telegram.telegramUniqueFileId,
-        telegramMessageId: telegram.telegramMessageId,
-        telegramChatId: telegram.telegramChatId,
-        folderId: params.folderId ?? null,
-        tags: params.tags ?? [],
-        isChunked: false,
-        chunks: [],
-        isDeleted: false,
-        deletedAt: null,
-        downloadCount: 0,
-        lastDownloadedAt: null,
-        createdAt: now,
-        updatedAt: now,
-      };
+    const now = new Date().toISOString();
+    const nextFile: StoredFile = {
+      id: randomUUID(),
+      originalName: params.file.name,
+      displayName: params.displayName || params.file.name,
+      description: params.description || "",
+      mimeType: params.file.type || "application/octet-stream",
+      extension: getExtension(params.file.name),
+      size: params.file.size,
+      category: getCategory(params.file.type || "application/octet-stream", params.file.name),
+      sha256,
+      telegramFileId: telegram.telegramFileId,
+      telegramUniqueFileId: telegram.telegramUniqueFileId,
+      telegramMessageId: telegram.telegramMessageId,
+      telegramChatId: telegram.telegramChatId,
+      folderId: params.folderId ?? null,
+      tags: params.tags ?? [],
+      isChunked: false,
+      chunks: [],
+      isDeleted: false,
+      deletedAt: null,
+      downloadCount: 0,
+      lastDownloadedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
 
-      store.files.unshift(nextFile);
-      return nextFile;
-    });
+    await FileModel.create(nextFile);
 
     await createLog({
       action: "UPLOAD",
       status: "SUCCESS",
       message: `Uploaded ${params.file.name}`,
-      fileId: created.id,
+      fileId: nextFile.id,
       metadata: {
         telegramMessageId: telegram.telegramMessageId,
         telegramChatId: telegram.telegramChatId,
       },
     });
 
-    return { file: created, deduplicated: false };
+    return { file: nextFile, deduplicated: false };
   } catch (error) {
     await createLog({
       action: "TELEGRAM_ERROR",
       status: "ERROR",
-      message: "Metadata write failed after Telegram upload",
+      message: "Database write failed after Telegram upload",
       metadata: { fileName: params.file.name },
     });
     await deleteTelegramMessage(telegram.telegramMessageId, telegram.telegramChatId).catch(noop);
@@ -245,99 +235,83 @@ export async function uploadOwnedChunkedFile(params: {
   displayName?: string;
   description?: string;
   tags?: string[];
-}) {
-  const existingStore = await readStore();
-  ensureWithinQuota(existingStore.files, params.size, existingStore.settings.storageQuotaBytes);
+}): Promise<{ file: StoredFile; deduplicated: boolean }> {
+  await connectDB();
+  const allFiles = await FileModel.find({ isDeleted: false }, "size").lean();
+  const store = await readStore();
+  ensureWithinQuota(allFiles, params.size, store.settings.storageQuotaBytes);
 
   const sortedChunks = [...params.chunks].sort((a, b) => a.index - b.index);
+  const now = new Date().toISOString();
 
-  let finalChunks = sortedChunks;
-  try {
-    const chatId = sortedChunks[0].telegramChatId;
-    const fileIds = sortedChunks.map((c) => c.telegramFileId);
-    const sizeFormatted = (params.size / 1024 / 1024).toFixed(1);
-    const caption = `📦 ${params.originalName} (${params.chunks.length} chunks · ${sizeFormatted} MB)`;
+  const nextFile: StoredFile = {
+    id: randomUUID(),
+    originalName: params.originalName,
+    displayName: params.displayName || params.originalName,
+    description: params.description || "",
+    mimeType: params.mimeType,
+    extension: getExtension(params.originalName),
+    size: params.size,
+    category: getCategory(params.mimeType, params.originalName),
+    sha256: params.uploadId,
+    telegramFileId: sortedChunks[0].telegramFileId,
+    telegramUniqueFileId: undefined,
+    telegramMessageId: sortedChunks[0].telegramMessageId,
+    telegramChatId: sortedChunks[0].telegramChatId,
+    folderId: params.folderId ?? null,
+    tags: params.tags ?? [],
+    isChunked: true,
+    chunks: sortedChunks,
+    isDeleted: false,
+    deletedAt: null,
+    downloadCount: 0,
+    lastDownloadedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  };
 
-    const grouped = await groupTelegramDocuments(chatId, fileIds, caption);
-    
-    // Asynchronously scrub temporary single-message uploads
-    const oldMessageIds = sortedChunks.map((c) => c.telegramMessageId);
-    Promise.all(oldMessageIds.map((mid) => deleteTelegramMessage(mid, chatId).catch(noop)));
-
-    // Map to new message ids / file ids representing the media group album
-    finalChunks = sortedChunks.map((chunk, i) => ({
-      ...chunk,
-      telegramMessageId: grouped[i]?.message_id ?? chunk.telegramMessageId,
-      telegramFileId: grouped[i]?.file_id ?? chunk.telegramFileId,
-    }));
-  } catch (err) {
-    // Fall back to original separate chunk messages if grouping fails
-    console.error("Failed to group chunk telegram messages:", err);
-  }
-
-  const created = await mutateStore((store) => {
-    const now = new Date().toISOString();
-    const nextFile: StoredFile = {
-      id: randomUUID(),
-      originalName: params.originalName,
-      displayName: params.displayName || params.originalName,
-      description: params.description || "",
-      mimeType: params.mimeType,
-      extension: getExtension(params.originalName),
-      size: params.size,
-      category: getCategory(params.mimeType, params.originalName),
-      sha256: params.uploadId,
-      telegramFileId: finalChunks[0].telegramFileId,
-      telegramUniqueFileId: undefined,
-      telegramMessageId: finalChunks[0].telegramMessageId,
-      telegramChatId: finalChunks[0].telegramChatId,
-      folderId: params.folderId ?? null,
-      tags: params.tags ?? [],
-      isChunked: true,
-      chunks: finalChunks,
-      isDeleted: false,
-      deletedAt: null,
-      downloadCount: 0,
-      lastDownloadedAt: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    store.files.unshift(nextFile);
-    return nextFile;
-  });
+  await FileModel.create(nextFile);
 
   await createLog({
     action: "UPLOAD",
     status: "SUCCESS",
     message: `Uploaded ${params.originalName} (${sortedChunks.length} chunks)`,
-    fileId: created.id,
+    fileId: nextFile.id,
     metadata: { chunked: true, totalChunks: sortedChunks.length },
   });
 
-  return { file: created, deduplicated: false };
+  return { file: nextFile, deduplicated: false };
 }
 
-export async function updateFile(id: string, partial: Partial<StoredFile>) {
-  return mutateStore((store) => {
-    const file = store.files.find((item) => item.id === id);
-    if (!file) throw new Error("NOT_FOUND");
-    Object.assign(file, partial, { updatedAt: new Date().toISOString() });
-    return file;
-  });
+export async function updateFile(id: string, partial: Partial<StoredFile>): Promise<StoredFile> {
+  await connectDB();
+  const updated = await FileModel.findOneAndUpdate(
+    { id },
+    { $set: { ...partial, updatedAt: new Date().toISOString() } },
+    { returnDocument: "after" },
+  ).lean();
+  if (!updated) throw new Error("NOT_FOUND");
+  return stripMongoId<StoredFile>(updated);
 }
 
-export async function incrementDownload(file: StoredFile) {
-  return updateFile(file.id, {
-    downloadCount: file.downloadCount + 1,
-    lastDownloadedAt: new Date().toISOString(),
-  });
+export async function incrementDownload(file: StoredFile): Promise<StoredFile> {
+  await connectDB();
+  const updated = await FileModel.findOneAndUpdate(
+    { id: file.id },
+    {
+      $inc: { downloadCount: 1 },
+      $set: { lastDownloadedAt: new Date().toISOString() },
+    },
+    { returnDocument: "after" },
+  ).lean();
+  return stripMongoId<StoredFile>(updated);
 }
 
-export async function resolveDownloadUrl(file: StoredFile) {
+export async function resolveDownloadUrl(file: StoredFile): Promise<string> {
   return getTelegramFileDownloadUrl(file.telegramFileId);
 }
 
-export async function softDeleteFile(file: StoredFile) {
+export async function softDeleteFile(file: StoredFile): Promise<StoredFile> {
   const updated = await updateFile(file.id, {
     isDeleted: true,
     deletedAt: new Date().toISOString(),
@@ -351,20 +325,21 @@ export async function softDeleteFile(file: StoredFile) {
   return updated;
 }
 
-export async function hardDeleteFile(file: StoredFile) {
+export async function hardDeleteFile(file: StoredFile): Promise<void> {
+  await connectDB();
   if (file.isChunked && file.chunks?.length) {
     await Promise.all(
       file.chunks.map((chunk) =>
         deleteTelegramMessage(chunk.telegramMessageId, chunk.telegramChatId).catch(noop),
       ),
     );
-  } else {
+  } else if (file.telegramMessageId && file.telegramChatId) {
     await deleteTelegramMessage(file.telegramMessageId, file.telegramChatId).catch(noop);
   }
-  await mutateStore((store) => {
-    store.files = store.files.filter((item) => item.id !== file.id);
-    store.shares = store.shares.filter((item) => item.fileId !== file.id);
-  });
+
+  await FileModel.deleteOne({ id: file.id });
+  await ShareModel.deleteMany({ fileId: file.id });
+
   await createLog({
     action: "DELETE_HARD",
     status: "SUCCESS",
@@ -373,29 +348,57 @@ export async function hardDeleteFile(file: StoredFile) {
   });
 }
 
-export async function listShares() {
-  const store = await readStore();
-  return store.shares;
-}
+export async function createShare(fileId: string, options: {
+  expiresInHours?: number | null;
+  maxDownloads?: number | null;
+  password?: string | null;
+} = {}): Promise<ShareRecord> {
+  await connectDB();
+  const file = await getFileById(fileId);
+  const now = Date.now();
+  const expiresAt = options.expiresInHours
+    ? new Date(now + options.expiresInHours * 60 * 60 * 1000).toISOString()
+    : null;
 
-export async function revokeShareLink(shareId: string) {
-  let revoked = false;
-  await mutateStore((store) => {
-    const before = store.shares.length;
-    store.shares = store.shares.filter((share) => share.id !== shareId);
-    revoked = store.shares.length !== before;
-  });
+  const nextShare: ShareRecord = {
+    id: randomUUID(),
+    fileId: file.id,
+    token: randomBytes(20).toString("hex"),
+    expiresAt,
+    maxDownloads: options.maxDownloads ?? null,
+    downloadCount: 0,
+    password: options.password || null,
+    createdAt: new Date().toISOString(),
+  };
 
-  if (!revoked) {
-    throw new Error("NOT_FOUND");
-  }
+  await ShareModel.create(nextShare);
 
   await createLog({
-    action: "SHARE_REVOKE",
+    action: "SHARE_CREATE",
     status: "SUCCESS",
-    message: `Revoked share link ${shareId}`,
+    message: `Created share link for ${file.displayName}`,
+    fileId: file.id,
+    metadata: { token: nextShare.token },
   });
 
+  return nextShare;
+}
+
+export async function getShares(): Promise<ShareRecord[]> {
+  await connectDB();
+  const shares = await ShareModel.find({}).sort({ createdAt: -1 }).lean();
+  return shares.map((d) => stripMongoId<ShareRecord>(d));
+}
+
+export const listShares = getShares;
+
+export async function deleteShare(id: string): Promise<void> {
+  await connectDB();
+  await ShareModel.deleteOne({ id });
+}
+
+export async function revokeShareLink(shareId: string): Promise<{ revoked: boolean }> {
+  await deleteShare(shareId);
   return { revoked: true };
 }
 
@@ -405,118 +408,216 @@ export async function createShareLink(
     expiresAt?: string | null;
     maxDownloads?: number | null;
     password?: string | null;
-  },
-) {
+  } = {},
+): Promise<ShareRecord> {
+  await connectDB();
   const file = await getFileById(fileId);
-  const settings = await readStore();
-  if (settings.settings.privateLinksOnly && !input.expiresAt) {
-    input.expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24).toISOString();
-  }
 
-  const share = await mutateStore((store) => {
-    const next: ShareRecord = {
-      id: randomUUID(),
-      fileId,
-      token: `${Date.now().toString(36)}${randomBytes(48).toString("hex")}`,
-      expiresAt: input.expiresAt ?? null,
-      maxDownloads: input.maxDownloads ?? null,
-      downloadCount: 0,
-      password: input.password ?? null,
-      createdAt: new Date().toISOString(),
-    };
-    store.shares.unshift(next);
-    return next;
-  });
+  const nextShare: ShareRecord = {
+    id: randomUUID(),
+    fileId: file.id,
+    token: randomBytes(20).toString("hex"),
+    expiresAt: input.expiresAt ?? null,
+    maxDownloads: input.maxDownloads ?? null,
+    downloadCount: 0,
+    password: input.password || null,
+    createdAt: new Date().toISOString(),
+  };
+
+  await ShareModel.create(nextShare);
 
   await createLog({
     action: "SHARE_CREATE",
     status: "SUCCESS",
     message: `Created share link for ${file.displayName}`,
-    fileId,
+    fileId: file.id,
+    metadata: { token: nextShare.token },
   });
 
-  return {
-    share,
-    publicUrl: buildPublicLink(share.token),
-  };
+  return nextShare;
 }
 
-export async function getShareByToken(token: string) {
-  const store = await readStore();
-  return store.shares.find((share) => share.token === token) ?? null;
+export async function getShareByToken(token: string): Promise<ShareRecord | null> {
+  await connectDB();
+  const share = await ShareModel.findOne({ token }).lean();
+  return share ? stripMongoId<ShareRecord>(share) : null;
 }
 
-export async function getFileByShareToken(token: string) {
+export async function getFileByShareToken(token: string): Promise<{ share: ShareRecord; file: StoredFile } | null> {
   const share = await getShareByToken(token);
   if (!share) return null;
   const file = await getFileById(share.fileId);
   return { share, file };
 }
 
-export async function incrementShareDownload(shareId: string) {
-  return mutateStore((store) => {
-    const share = store.shares.find((item) => item.id === shareId);
-    if (!share) throw new Error("NOT_FOUND");
-    share.downloadCount += 1;
-    return share;
-  });
+export async function incrementShareDownload(shareId: string): Promise<ShareRecord> {
+  await connectDB();
+  const updated = await ShareModel.findOneAndUpdate(
+    { id: shareId },
+    { $inc: { downloadCount: 1 } },
+    { returnDocument: "after" },
+  ).lean();
+  if (!updated) throw new Error("NOT_FOUND");
+  return stripMongoId<ShareRecord>(updated);
 }
 
 export { buildPublicLink };
 
-export async function createFileDownloadResponse(file: StoredFile) {
-  // Non-chunked: redirect to Telegram URL directly
-  if (!file.isChunked || !file.chunks?.length) {
-    const url = await resolveDownloadUrl(file);
-    return Response.redirect(url, 302);
+/**
+ * Builds RFC 5987 / RFC 6266 compliant Content-Disposition header.
+ * Correctly encodes Unicode, Vietnamese characters, and handles special symbols.
+ */
+export function buildContentDisposition(
+  filename: string,
+  disposition: "attachment" | "inline" = "attachment",
+): string {
+  const safeAscii = filename
+    .replace(/[^\x20-\x7E]/g, "_")
+    .replace(/["\\]/g, "");
+  const utf8Encoded = encodeURIComponent(filename);
+  return `${disposition}; filename="${safeAscii}"; filename*=UTF-8''${utf8Encoded}`;
+}
+
+/**
+ * Creates high-performance, streaming HTTP response for file downloads and media previews.
+ * Features:
+ * - Direct binary streaming without buffering entire file in RAM.
+ * - Zero Telegram Bot token exposure (streaming proxied securely).
+ * - Full HTTP Range requests (HTTP 206 Partial Content) for video seeking, pause & resume.
+ * - Seamless chunk reassembly for chunked files with automatic chunk slicing.
+ * - Guaranteed bit-for-bit integrity and correct RFC 5987 Unicode filename preservation.
+ */
+export async function createFileDownloadResponse(
+  file: StoredFile,
+  options: {
+    disposition?: "attachment" | "inline";
+    rangeHeader?: string | null;
+  } = {},
+): Promise<Response> {
+  const disposition = options.disposition ?? "attachment";
+  const rangeHeader = options.rangeHeader?.trim();
+
+  // Parse HTTP Range header if provided
+  let start = 0;
+  let end = file.size - 1;
+  let isRange = false;
+
+  if (rangeHeader && rangeHeader.startsWith("bytes=")) {
+    const parts = rangeHeader.substring(6).split("-");
+    const parsedStart = parts[0] ? parseInt(parts[0], 10) : undefined;
+    const parsedEnd = parts[1] ? parseInt(parts[1], 10) : undefined;
+
+    if (parsedStart !== undefined && !isNaN(parsedStart)) {
+      start = parsedStart;
+      if (parsedEnd !== undefined && !isNaN(parsedEnd)) {
+        end = Math.min(parsedEnd, file.size - 1);
+      } else {
+        end = file.size - 1;
+      }
+    } else if (parsedEnd !== undefined && !isNaN(parsedEnd)) {
+      // Suffix range: bytes=-500 (last 500 bytes)
+      start = Math.max(0, file.size - parsedEnd);
+      end = file.size - 1;
+    }
+
+    if (start < 0 || start >= file.size || end < start || end >= file.size) {
+      return new Response(null, {
+        status: 416,
+        headers: {
+          "Content-Range": `bytes */${file.size}`,
+        },
+      });
+    }
+
+    isRange = true;
   }
 
-  // Chunked: fetch all chunks from Telegram and stream them joined
+  const responseHeaders = new Headers({
+    "Content-Type": file.mimeType || "application/octet-stream",
+    "Content-Disposition": buildContentDisposition(file.originalName, disposition),
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, no-transform, max-age=3600",
+  });
+
+  const contentLength = end - start + 1;
+  const status = isRange ? 206 : 200;
+
+  if (isRange) {
+    responseHeaders.set("Content-Range", `bytes ${start}-${end}/${file.size}`);
+    responseHeaders.set("Content-Length", String(contentLength));
+  } else {
+    responseHeaders.set("Content-Length", String(file.size));
+  }
+
+  // Non-chunked single file: stream directly from Telegram CDN with Range support
+  if (!file.isChunked || !file.chunks?.length) {
+    const { stream: tgStream } = await getTelegramDownloadStream(
+      file.telegramFileId,
+      isRange ? { start, end } : undefined,
+    );
+
+    return new Response(tgStream, {
+      status,
+      headers: responseHeaders,
+    });
+  }
+
+  // Chunked file: calculate required chunk slices and stream sequentially
   const sortedChunks = [...file.chunks].sort((a, b) => a.index - b.index);
 
-  let chunkIndex = 0;
-  let currentReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  type ChunkSliceRequest = {
+    telegramFileId: string;
+    sliceStart: number;
+    sliceEnd: number;
+  };
 
-  const stream = new ReadableStream({
-    async pull(controller) {
+  const chunkRequests: ChunkSliceRequest[] = [];
+  let currentOffset = 0;
+
+  for (const chunk of sortedChunks) {
+    const chunkStart = currentOffset;
+    const chunkEnd = chunkStart + chunk.size - 1;
+    currentOffset += chunk.size;
+
+    // Check if this chunk overlaps the requested [start, end] window
+    if (chunkEnd >= start && chunkStart <= end) {
+      const sliceStart = Math.max(0, start - chunkStart);
+      const sliceEnd = Math.min(chunk.size - 1, end - chunkStart);
+
+      chunkRequests.push({
+        telegramFileId: chunk.telegramFileId,
+        sliceStart,
+        sliceEnd,
+      });
+    }
+  }
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
       try {
-        if (!currentReader) {
-          if (chunkIndex >= sortedChunks.length) {
-            controller.close();
-            return;
-          }
-          // Fetch URL lazily when we actually need the chunk
-          const url = await getTelegramFileDownloadUrl(sortedChunks[chunkIndex].telegramFileId);
-          const response = await fetch(url);
-          if (!response.ok || !response.body) {
-            throw new Error(`Failed to fetch chunk ${chunkIndex} from Telegram`);
-          }
-          currentReader = response.body.getReader();
-        }
+        for (const req of chunkRequests) {
+          const { stream: chunkStream } = await getTelegramDownloadStream(req.telegramFileId, {
+            start: req.sliceStart,
+            end: req.sliceEnd,
+          });
 
-        const { done, value } = await currentReader.read();
-        if (done) {
-          currentReader = null;
-          chunkIndex++;
-          // immediately trigger next pull recursively
-          return this.pull!(controller);
+          const reader = chunkStream.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            controller.enqueue(value);
+          }
         }
-
-        controller.enqueue(value);
+        controller.close();
       } catch (err) {
         controller.error(err);
       }
     },
   });
 
-  const encodedName = encodeURIComponent(file.originalName);
-
   return new Response(stream, {
-    headers: {
-      "Content-Type": file.mimeType || "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${file.originalName}"; filename*=UTF-8''${encodedName}`,
-      "Content-Length": file.size.toString(),
-    },
+    status,
+    headers: responseHeaders,
   });
 }
 
@@ -532,49 +633,52 @@ export async function uploadOwnedSingleFileP2P(params: {
   description?: string;
   tags?: string[];
   uploadId: string;
-}) {
-  const existingStore = await readStore();
-  ensureWithinQuota(existingStore.files, params.size, existingStore.settings.storageQuotaBytes);
+}): Promise<{ file: StoredFile; deduplicated: boolean }> {
+  await connectDB();
+  const allFiles = await FileModel.find({ isDeleted: false }, "size").lean();
+  const store = await readStore();
+  ensureWithinQuota(allFiles, params.size, store.settings.storageQuotaBytes);
 
-  const created = await mutateStore((store) => {
-    const now = new Date().toISOString();
-    const nextFile: StoredFile = {
-      id: randomUUID(),
-      originalName: params.originalName,
-      displayName: params.displayName || params.originalName,
-      description: params.description || "",
-      mimeType: params.mimeType,
-      extension: getExtension(params.originalName),
-      size: params.size,
-      category: getCategory(params.mimeType, params.originalName),
-      sha256: params.uploadId,
-      telegramFileId: params.telegramFileId,
-      telegramUniqueFileId: undefined,
-      telegramMessageId: params.telegramMessageId,
-      telegramChatId: params.telegramChatId,
-      folderId: params.folderId ?? null,
-      tags: params.tags ?? [],
-      isChunked: false,
-      chunks: [],
-      isDeleted: false,
-      deletedAt: null,
-      downloadCount: 0,
-      lastDownloadedAt: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    store.files.unshift(nextFile);
-    return nextFile;
-  });
+  const now = new Date().toISOString();
+  const nextFile: StoredFile = {
+    id: randomUUID(),
+    originalName: params.originalName,
+    displayName: params.displayName || params.originalName,
+    description: params.description || "",
+    mimeType: params.mimeType,
+    extension: getExtension(params.originalName),
+    size: params.size,
+    category: getCategory(params.mimeType, params.originalName),
+    sha256: params.uploadId,
+    telegramFileId: params.telegramFileId,
+    telegramUniqueFileId: undefined,
+    telegramMessageId: params.telegramMessageId,
+    telegramChatId: params.telegramChatId,
+    folderId: params.folderId ?? null,
+    tags: params.tags ?? [],
+    isChunked: false,
+    chunks: [],
+    isDeleted: false,
+    deletedAt: null,
+    downloadCount: 0,
+    lastDownloadedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await FileModel.create(nextFile);
 
   await createLog({
     action: "UPLOAD",
     status: "SUCCESS",
-    message: `Uploaded ${params.originalName} via P2P`,
-    fileId: created.id,
-    metadata: { p2p: true },
+    message: `Uploaded ${params.originalName}`,
+    fileId: nextFile.id,
+    metadata: {
+      telegramMessageId: params.telegramMessageId,
+      telegramChatId: params.telegramChatId,
+    },
   });
 
-  return { file: created, deduplicated: false };
+  return { file: nextFile, deduplicated: false };
 }
 

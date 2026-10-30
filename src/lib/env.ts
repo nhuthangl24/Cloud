@@ -1,20 +1,22 @@
 import { z } from "zod";
 
+const emptyToUndefined = (v: unknown) => (typeof v === "string" && v.trim() === "" ? undefined : v);
+
 const envSchema = z.object({
-  TELEGRAM_BOT_TOKEN: z.string().min(1).default("telegram-token-placeholder"),
-  TELEGRAM_BOT_TOKENS: z.string().optional(),
-  TELEGRAM_STORAGE_CHAT_ID: z.string().min(1).default("-1000000000000"),
-  MONGODB_URI: z.string().min(1, "MONGODB_URI is required"),
-  AUTH_USERNAME: z.string().min(1).default("admin"),
-  AUTH_PASSWORD: z.string().min(8).default("ChangeMe123!"),
-  AUTH_PASSWORD_HASH: z.string().optional(),
-  AUTH_SECRET: z.string().min(32).default("change-this-auth-secret-in-env-for-production"),
-  SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24),
-  MAX_FILE_SIZE: z.string().default("52428800"),
-  ALLOWED_MIME_TYPES: z.string().default("*/*"),
-  DEFAULT_STORAGE_QUOTA: z.string().default("5497558138880"),
-  PUBLIC_APP_URL: z.string().min(1).default("http://localhost:3000"),
-  PRIVATE_LINKS_ONLY: z.string().default("true"),
+  TELEGRAM_BOT_TOKEN: z.preprocess(emptyToUndefined, z.string().default("telegram-token-placeholder")),
+  TELEGRAM_BOT_TOKENS: z.preprocess(emptyToUndefined, z.string().optional()),
+  TELEGRAM_STORAGE_CHAT_ID: z.preprocess(emptyToUndefined, z.string().default("-1000000000000")),
+  MONGODB_URI: z.preprocess(emptyToUndefined, z.string().default("mongodb://127.0.0.1:27017/cloud")),
+  AUTH_USERNAME: z.preprocess(emptyToUndefined, z.string().default("admin")),
+  AUTH_PASSWORD: z.preprocess(emptyToUndefined, z.string().default("ChangeMe123!")),
+  AUTH_PASSWORD_HASH: z.preprocess(emptyToUndefined, z.string().optional()),
+  AUTH_SECRET: z.preprocess(emptyToUndefined, z.string().default("change-this-auth-secret-in-env-for-production-min32chars")),
+  SESSION_TTL_HOURS: z.preprocess(emptyToUndefined, z.coerce.number().int().positive().default(24)),
+  MAX_FILE_SIZE: z.preprocess(emptyToUndefined, z.string().default("52428800")),
+  ALLOWED_MIME_TYPES: z.preprocess(emptyToUndefined, z.string().default("*/*")),
+  DEFAULT_STORAGE_QUOTA: z.preprocess(emptyToUndefined, z.string().default("5497558138880")),
+  PUBLIC_APP_URL: z.preprocess(emptyToUndefined, z.string().default("http://localhost:3000")),
+  PRIVATE_LINKS_ONLY: z.preprocess(emptyToUndefined, z.string().default("true")),
 });
 
 export const env = envSchema.parse({
